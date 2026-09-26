@@ -4,6 +4,7 @@ import './index.css';
 import XlsxViewer from './preview/viewers/XlsxViewer';
 import DocxViewer from './preview/viewers/DocxViewer';
 import PdfViewer from './preview/viewers/PdfViewer';
+import PptxViewer from './preview/viewers/PptxViewer';
 
 async function fetchBuf(path: string): Promise<ArrayBuffer> {
   const res = await fetch(path);
@@ -15,6 +16,7 @@ interface Samples {
   xlsx?: ArrayBuffer;
   docx?: ArrayBuffer;
   pdf?: ArrayBuffer;
+  pptx?: ArrayBuffer;
 }
 
 export default function PreviewHarness() {
@@ -28,12 +30,13 @@ export default function PreviewHarness() {
     window.addEventListener('error', onError);
     (async () => {
       try {
-        const [xlsx, docx, pdf] = await Promise.all([
+        const [xlsx, docx, pdf, pptx] = await Promise.all([
           fetchBuf('/src/preview/samples/test.xlsx'),
           fetchBuf('/src/preview/samples/test.docx'),
           fetchBuf('/src/preview/samples/test.pdf'),
+          fetchBuf('/src/preview/samples/test.pptx'),
         ]);
-        setSamples({ xlsx, docx, pdf });
+        setSamples({ xlsx, docx, pdf, pptx });
         setStatus('ready');
       } catch (e) {
         setStatus('failed: ' + (e as Error).message);
@@ -62,6 +65,10 @@ export default function PreviewHarness() {
       <div className="panel" id="panel-pdf" style={{ height: '70vh' }}>
         <h2>PDF</h2>
         {samples.pdf && <PdfViewer fileName="test.pdf" data={samples.pdf} />}
+      </div>
+      <div className="panel" id="panel-pptx" style={{ height: '70vh' }}>
+        <h2>PPTX</h2>
+        {samples.pptx && <PptxViewer fileName="test.pptx" data={samples.pptx} />}
       </div>
     </div>
   );

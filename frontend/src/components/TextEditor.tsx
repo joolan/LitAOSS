@@ -20,6 +20,7 @@ export default function TextEditor({ file, fileName, onClose }: TextEditorProps)
   const [showVersions, setShowVersions] = useState(false);
   const [versions, setVersions] = useState<FileVersion[]>([]);
   const [loadingVersions, setLoadingVersions] = useState(false);
+  const [closeConfirm, setCloseConfirm] = useState(false);
 
   useEffect(() => {
     loadContent();
@@ -60,8 +61,8 @@ export default function TextEditor({ file, fileName, onClose }: TextEditorProps)
     }
   };
 
-  const handleSave = async () => {
-    if (content === originalContent) return;
+  const handleSave = async (): Promise<boolean> => {
+    if (content === originalContent) return true;
     setSaving(true);
     setError('');
     setSaved(false);
@@ -130,11 +131,24 @@ export default function TextEditor({ file, fileName, onClose }: TextEditorProps)
       setOriginalContent(content);
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
+      return true;
     } catch (err) {
       setError('保存失败: ' + (err as Error).message);
+      return false;
     } finally {
       setSaving(false);
     }
+  };
+
+  const requestClose = () => {
+    if (hasChanges) setCloseConfirm(true);
+    else onClose();
+  };
+
+  const handleSaveAndClose = async () => {
+    const ok = await handleSave();
+    if (ok) onClose();
+    else setCloseConfirm(false);
   };
 
   const loadVersions = async () => {
@@ -189,10 +203,9 @@ export default function TextEditor({ file, fileName, onClose }: TextEditorProps)
   };
 
   return (
-    <div className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4" onClick={onClose}>
+    <div className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4">
       <div
         className="bg-gray-900 rounded-2xl w-full max-w-5xl h-[85vh] flex flex-col overflow-hidden"
-        onClick={(e) => e.stopPropagation()}
         onKeyDown={handleKeyDown}
       >
         <div className="flex items-center justify-between px-4 py-3 border-b border-gray-800">
@@ -209,7 +222,7 @@ export default function TextEditor({ file, fileName, onClose }: TextEditorProps)
               </span>
             )}
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-shrink-0">
             <button
               onClick={handleShowVersions}
               className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-gray-700 hover:bg-gray-600 rounded-lg text-sm transition-colors"
@@ -226,8 +239,9 @@ export default function TextEditor({ file, fileName, onClose }: TextEditorProps)
               {saving ? '保存中...' : '保存'}
             </button>
             <button
-              onClick={onClose}
+              onClick={requestClose}
               className="p-1.5 hover:bg-gray-700 rounded transition-colors"
+              title="关闭"
             >
               <X className="w-4 h-4 text-gray-400" />
             </button>
@@ -296,6 +310,41 @@ export default function TextEditor({ file, fileName, onClose }: TextEditorProps)
           <span>{content.length} 字符 · {content.split('\n').length} 行</span>
         </div>
       </div>
+
+      {closeConfirm && (
+        <div className="fixed inset-0 z-[60] bg-black/80 flex items-center justify-center p-4">
+          <div className="bg-gray-900 border border-gray-800 rounded-2xl p-6 w-full max-w-sm shadow-2xl">
+            <div className="flex items-center gap-3 mb-3">
+              <div className="p-2 bg-amber-500/10 rounded-lg">
+                <AlertCircle className="w-5 h-5 text-amber-400" />
+              </div>
+              <h3 className="text-lg font-semibold text-white">未保存的修改</h3>
+            </div>
+            <p className="text-gray-400 text-sm mb-5">内容已修改且尚未保存，如何处理？</p>
+            <div className="flex flex-col gap-2">
+              <button
+                onClick={handleSaveAndClose}
+                disabled={saving}
+                className="w-full py-2.5 bg-emerald-600 hover:bg-emerald-500 disabled:bg-gray-700 text-white rounded-lg font-medium transition-colors"
+              >
+                {saving ? '保存中...' : '保存并关闭'}
+              </button>
+              <button
+                onClick={onClose}
+                className="w-full py-2.5 bg-gray-800 hover:bg-gray-700 text-white rounded-lg font-medium transition-colors"
+              >
+                放弃修改并关闭
+              </button>
+              <button
+                onClick={() => setCloseConfirm(false)}
+                className="w-full py-2 bg-transparent hover:bg-gray-800 text-gray-400 rounded-lg text-sm transition-colors"
+              >
+                取消
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -374,10 +374,9 @@ export default function BackupSettings({ onError, onSuccess }: BackupSettingsPro
 
       {/* 备份方式二选一 */}
       {showBackupChoice && (
-        <div className="fixed inset-0 z-[60] bg-black/80 flex items-center justify-center p-4" onClick={() => setShowBackupChoice(false)}>
+        <div className="fixed inset-0 z-[60] bg-black/80 flex items-center justify-center p-4">
           <div
             className="bg-gray-900 rounded-2xl p-6 w-full max-w-sm"
-            onClick={(e) => e.stopPropagation()}
           >
             <div className="flex items-center gap-3 mb-4">
               <div className="p-2 bg-blue-500/10 rounded-lg">
@@ -416,10 +415,9 @@ export default function BackupSettings({ onError, onSuccess }: BackupSettingsPro
       )}
 
       {mfaRestore && (
-        <div className="fixed inset-0 z-[60] bg-black/80 flex items-center justify-center p-4" onClick={() => setMfaRestore(null)}>
+        <div className="fixed inset-0 z-[60] bg-black/80 flex items-center justify-center p-4">
           <div
             className="bg-gray-900 rounded-2xl p-6 w-full max-w-sm"
-            onClick={(e) => e.stopPropagation()}
           >
             <div className="flex items-center gap-3 mb-4">
               <div className="p-2 bg-emerald-500/10 rounded-lg">

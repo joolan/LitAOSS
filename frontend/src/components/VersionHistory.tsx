@@ -181,14 +181,14 @@ export default function VersionHistory({ file, fileName, onClose, onChanged }: V
             <div className="text-center text-gray-500 py-8">暂无历史版本</div>
           ) : (
             versions.map((v) => (
-              <div key={v.id} className="flex items-center justify-between p-3 bg-gray-800 rounded-lg">
+              <div key={v.id} className="flex flex-wrap items-center justify-between gap-2 p-3 bg-gray-800 rounded-lg">
                 <div>
                   <div className="text-white text-sm font-medium">版本 {v.version}</div>
                   <div className="text-xs text-gray-400">
                     {new Date(v.created_at).toLocaleString()} · {formatSize(v.file_size)}
                   </div>
                 </div>
-                <div className="flex gap-2">
+                <div className="flex flex-wrap gap-2">
                   {(getPreviewMode(fileName) === 'image' || getPreviewMode(fileName) === 'text') && (
                     <button
                       onClick={() => handlePreview(v)}
@@ -220,7 +220,7 @@ export default function VersionHistory({ file, fileName, onClose, onChanged }: V
       </div>
 
       {previewV && (
-        <div className="fixed inset-0 z-[60] bg-black/80 flex items-center justify-center p-4" onClick={closePreview}>
+        <div className="fixed inset-0 z-[60] bg-black/80 flex items-center justify-center p-4">
           <div
             className="bg-gray-900 rounded-2xl w-full max-w-4xl max-h-[85vh] flex flex-col overflow-hidden"
             onClick={(e) => e.stopPropagation()}

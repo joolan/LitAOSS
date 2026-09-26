@@ -25,6 +25,10 @@ export default defineConfig({
       ],
     }),
   ],
+  // PptxViewer 含 ECharts，按需分包 ~1.1MB（gz ~360KB），仅打开 pptx 时加载
+  build: {
+    chunkSizeWarningLimit: 1200,
+  },
   server: {
     port: 3000,
     proxy: {

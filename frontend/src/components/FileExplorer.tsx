@@ -13,10 +13,13 @@ import {
 } from '../crypto/fileKey';
 import { getPreviewMode } from '../crypto/crypto';
 import { resolvePreview } from '../preview';
+import { collectDroppedFiles, collectPickedFiles } from '../upload/walkEntries';
+import { PendingUpload } from '../upload/types';
 import FilePreview from './FilePreview';
 import TextEditor from './TextEditor';
 import VersionHistory from './VersionHistory';
 import Settings from './Settings';
+import UploadQueueDialog from './UploadQueueDialog';
 
 interface FileExplorerProps {
   onLock: () => void;
@@ -33,8 +36,8 @@ export default function FileExplorer({ onLock }: FileExplorerProps) {
   ]);
   const [viewMode, setViewMode] = useState<ViewMode>('grid');
   const [loading, setLoading] = useState(true);
-  const [uploading, setUploading] = useState(false);
-  const [uploadProgress, setUploadProgress] = useState(0);
+  const [uploadQueue, setUploadQueue] = useState<PendingUpload[] | null>(null);
+  const [dragActive, setDragActive] = useState(false);
   const [previewFile, setPreviewFile] = useState<FileRecord | null>(null);
   const [editingFile, setEditingFile] = useState<FileRecord | null>(null);
   const [versionFile, setVersionFile] = useState<FileRecord | null>(null);
@@ -55,7 +58,9 @@ export default function FileExplorer({ onLock }: FileExplorerProps) {
   const [renameValue, setRenameValue] = useState('');
   const [error, setError] = useState('');
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const folderInputRef = useRef<HTMLInputElement>(null);
   const renameInputRef = useRef<HTMLInputElement>(null);
+  const dragDepthRef = useRef(0);
 
   const decryptName = useCallback(async (encryptedName: string): Promise<string> => {
     if (!getSessionPassword()) return '(未解锁)';
@@ -154,92 +159,67 @@ export default function FileExplorer({ onLock }: FileExplorerProps) {
     }
   };
 
-  const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handlePickFiles = (e: React.ChangeEvent<HTMLInputElement>) => {
     const fileList = e.target.files;
-    if (!fileList || fileList.length === 0) return;
+    if (!fileList || fileList.length === 0) {
+      e.target.value = '';
+      return;
+    }
+    const items = collectPickedFiles(fileList);
+    e.target.value = '';
+    setUploadQueue(items);
+  };
 
-    setUploading(true);
-    setUploadProgress(0);
-    setError('');
+  const hasFiles = (e: React.DragEvent) =>
+    Array.from(e.dataTransfer?.types || []).includes('Files');
 
+  const handleDragEnter = (e: React.DragEvent) => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    dragDepthRef.current += 1;
+    setDragActive(true);
+  };
+
+  const handleDragOver = (e: React.DragEvent) => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+  };
+
+  const handleDragLeave = (e: React.DragEvent) => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+    if (dragDepthRef.current === 0) setDragActive(false);
+  };
+
+  const handleDrop = async (e: React.DragEvent) => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    dragDepthRef.current = 0;
+    setDragActive(false);
     try {
-      for (let i = 0; i < fileList.length; i++) {
-        const file = fileList[i];
-        setUploadProgress(Math.round(((i) / fileList.length) * 100));
-
-        if (file.size > 200 * 1024 * 1024) {
-          const sizeMb = (file.size / 1024 / 1024).toFixed(1);
-          const proceed = confirm(
-            `文件「${file.name}」(${sizeMb} MB) 超过 200MB，` +
-            `大文件在浏览器内加密容易因内存不足而上传失败。\n\n是否仍要继续上传？`,
-          );
-          if (!proceed) continue;
-        }
-
-        const arrayBuffer = await file.arrayBuffer();
-        const iv = crypto.getRandomValues(new Uint8Array(12));
-        const fileKey = await crypto.subtle.generateKey(
-          { name: 'AES-GCM', length: 256 },
-          true,
-          ['encrypt', 'decrypt'],
-        );
-
-        const ciphertext = await crypto.subtle.encrypt(
-          { name: 'AES-GCM', iv, tagLength: 128 },
-          fileKey,
-          arrayBuffer,
-        );
-
-        const fileKeyRaw = await crypto.subtle.exportKey('raw', fileKey);
-        const fileKeyBase64 = btoa(String.fromCharCode(...new Uint8Array(fileKeyRaw)));
-
-        const encryptedFileKey = await wrapFileKeyForStorage(fileKeyBase64);
-
-        const nameEncrypted = await encryptName(file.name);
-
-        const ossKeyRes = await api.generateOSSKey();
-        const ossKey = ossKeyRes.oss_key;
-
-        const presignRes = await api.getPresignUploadUrl(ossKey);
-        await new Promise<void>((resolve, reject) => {
-          const xhr = new XMLHttpRequest();
-          xhr.upload.onprogress = (ev) => {
-            if (ev.lengthComputable) {
-              const overall = Math.round(((i + ev.loaded / ev.total) / fileList.length) * 100);
-              setUploadProgress(overall);
-            }
-          };
-          xhr.onload = () => {
-            if (xhr.status >= 200 && xhr.status < 300) resolve();
-            else reject(new Error(`upload failed: ${xhr.status}`));
-          };
-          xhr.onerror = () => reject(new Error('network error'));
-          xhr.open('PUT', presignRes.url);
-          xhr.send(ciphertext);
-        });
-
-        await api.createFileRecord({
-          name_encrypted: nameEncrypted,
-          parent_id: currentFolder || undefined,
-          file_size: ciphertext.byteLength,
-          file_type: file.type,
-          encrypted_file_key: encryptedFileKey,
-          iv: Array.from(iv),
-          salt: [],
-          oss_key: ossKey,
-        });
+      const items = await collectDroppedFiles(e.dataTransfer);
+      if (items.length > 0) {
+        setUploadQueue(items);
+      } else {
+        setError('无法读取拖入的文件');
       }
-
-      loadFiles(currentFolder, true);
     } catch (err) {
-      console.error('upload error:', err);
-      setError('上传失败: ' + (err as Error).message);
-    } finally {
-      setUploading(false);
-      setUploadProgress(0);
-      if (fileInputRef.current) fileInputRef.current.value = '';
+      console.error('drop error:', err);
+      setError('读取拖入的文件失败: ' + (err as Error).message);
     }
   };
+
+  useEffect(() => {
+    const prevent = (e: DragEvent) => e.preventDefault();
+    window.addEventListener('dragover', prevent);
+    window.addEventListener('drop', prevent);
+    return () => {
+      window.removeEventListener('dragover', prevent);
+      window.removeEventListener('drop', prevent);
+    };
+  }, []);
 
   const handleCreateFolder = async () => {
     if (!newFolderName.trim()) return;
@@ -477,19 +457,39 @@ export default function FileExplorer({ onLock }: FileExplorerProps) {
         )}
 
         <div
-          className="bg-gray-900/50 rounded-xl p-4 min-h-[60vh]"
+          className="relative bg-gray-900/50 rounded-xl p-4 min-h-[60vh]"
           onContextMenu={handleEmptyContextMenu}
           onClick={() => setEmptyMenu(null)}
+          onDragEnter={handleDragEnter}
+          onDragOver={handleDragOver}
+          onDragLeave={handleDragLeave}
+          onDrop={handleDrop}
         >
+          {dragActive && (
+            <div className="absolute inset-0 z-20 rounded-xl border-2 border-dashed border-emerald-400 bg-emerald-500/10 flex flex-col items-center justify-center gap-3 pointer-events-none">
+              <Upload className="w-10 h-10 text-emerald-400" />
+              <p className="text-sm font-medium text-emerald-300">松开鼠标，添加到上传队列</p>
+              <p className="text-xs text-emerald-400/70">支持文件与文件夹，文件夹将保持原有层级</p>
+            </div>
+          )}
           <div className="flex flex-wrap items-center justify-between gap-2 mb-4">
           <div className="flex flex-wrap items-center gap-2">
             <input
               ref={fileInputRef}
               type="file"
               multiple
-              onChange={handleUpload}
+              onChange={handlePickFiles}
               className="hidden"
               id="file-upload"
+            />
+            <input
+              ref={folderInputRef}
+              type="file"
+              multiple
+              onChange={handlePickFiles}
+              className="hidden"
+              id="folder-upload"
+              {...({ webkitdirectory: '', directory: '' } as Record<string, string>)}
             />
             <label
               htmlFor="file-upload"
@@ -497,6 +497,13 @@ export default function FileExplorer({ onLock }: FileExplorerProps) {
             >
               <Upload className="w-4 h-4" />
               上传文件
+            </label>
+            <label
+              htmlFor="folder-upload"
+              className="inline-flex items-center gap-2 px-4 py-2 bg-emerald-600/80 hover:bg-emerald-500 rounded-lg cursor-pointer transition-colors text-sm"
+            >
+              <Folder className="w-4 h-4" />
+              上传文件夹
             </label>
             <button
               onClick={() => setShowNewFolder(true)}
@@ -549,21 +556,6 @@ export default function FileExplorer({ onLock }: FileExplorerProps) {
             </div>
           </div>
         </div>
-
-        {uploading && (
-          <div className="mb-4 p-3 bg-emerald-500/10 rounded-lg">
-            <div className="flex items-center justify-between text-sm text-emerald-400 mb-2">
-              <span>加密上传中...</span>
-              <span>{uploadProgress}%</span>
-            </div>
-            <div className="w-full bg-gray-800 rounded-full h-2">
-              <div
-                className="bg-emerald-500 h-2 rounded-full transition-all"
-                style={{ width: `${uploadProgress}%` }}
-              />
-            </div>
-          </div>
-        )}
 
         {showNewFolder && (
           <div className="mb-4 flex items-center gap-2">
@@ -934,10 +926,9 @@ export default function FileExplorer({ onLock }: FileExplorerProps) {
       {showSettings && <Settings onClose={() => setShowSettings(false)} />}
 
       {mfaDeleteFile && (
-        <div className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4" onClick={() => setMfaDeleteFile(null)}>
+        <div className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4">
           <div
             className="bg-gray-900 rounded-2xl p-6 w-full max-w-sm"
-            onClick={(e) => e.stopPropagation()}
           >
             <div className="flex items-center gap-3 mb-4">
               <div className="p-2 bg-emerald-500/10 rounded-lg">
@@ -985,10 +976,9 @@ export default function FileExplorer({ onLock }: FileExplorerProps) {
       )}
 
       {showLockConfirm && (
-        <div className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4" onClick={() => setShowLockConfirm(false)}>
+        <div className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4">
           <div
             className="bg-gray-900 rounded-2xl p-6 w-full max-w-sm"
-            onClick={(e) => e.stopPropagation()}
           >
             <div className="flex items-center gap-3 mb-4">
               <div className="p-2 bg-amber-500/10 rounded-lg">
@@ -1015,6 +1005,16 @@ export default function FileExplorer({ onLock }: FileExplorerProps) {
             </div>
           </div>
         </div>
+      )}
+
+      {uploadQueue && (
+        <UploadQueueDialog
+          items={uploadQueue}
+          targetFolderId={currentFolder}
+          targetLabel={breadcrumbs.map((b) => b.name).join(' / ')}
+          onClose={() => setUploadQueue(null)}
+          onUploaded={() => loadFiles(currentFolder, true)}
+        />
       )}
     </div>
   );

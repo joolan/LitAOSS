@@ -85,10 +85,9 @@ export default function FilePreview({ file, fileName, onClose }: FilePreviewProp
   const showZoom = preview?.kind === 'text';
 
   return (
-    <div className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4" onClick={onClose}>
+    <div className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4">
       <div
         className="bg-gray-900 rounded-2xl w-full max-w-4xl max-h-[90vh] flex flex-col overflow-hidden"
-        onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between px-4 py-3 border-b border-gray-800">
           <div className="flex items-center gap-3 min-w-0">
@@ -102,7 +101,7 @@ export default function FilePreview({ file, fileName, onClose }: FilePreviewProp
               </span>
             )}
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-shrink-0">
             {showZoom && (
               <>
                 <button

@@ -9,7 +9,7 @@ LitAOSS 是一个端到端加密的私有存储系统。文件在浏览器端完
 - 文件加密在浏览器端完成，服务端仅存储密文
 - SecretKey 加密存储于配置文件，启动时自动解密
 - 数据库文件支持加密存储，停止服务后自动加密
-- 在线预览图片、文本、PDF、Word、Excel（前端可插拔渲染，见 §7.2）
+- 在线预览图片、文本、PDF、Word、Excel、PPT（前端可插拔渲染，见 §7.2）
 - 支持文本文件在线编辑并加密保存
 - 单用户自用，无需多用户权限体系
 
@@ -74,7 +74,13 @@ LitAOSS 是一个端到端加密的私有存储系统。文件在浏览器端完
 #### 上传流程
 
 ```
-用户选择文件
+拖入文件/文件夹 或 选择文件/文件夹
+    │
+    ▼
+解析为待上传队列 (保留相对路径层级)，弹窗列出队列
+    │  用户确认后才开始 (可逐项移除/清空)
+    ▼
+逐个上传: 按相对路径逐级确保存在目标文件夹 (已存在则复用，否则创建，会话内缓存)
     │
     ▼
 浏览器生成随机 File Key (AES-256)
@@ -98,7 +104,7 @@ AES-KW 包装 File Key (用 Account Key)
 #### 下载/预览流程
 
 ```
-前置检查: 类型可预览 且 size ≤ 类型上限（图片/文本 200MB、PDF 100MB、Word/Excel 50MB）
+前置检查: 类型可预览 且 size ≤ 类型上限（图片/文本 200MB、PDF 100MB、Word/Excel/PPT 50MB）
     │  不通过 → 直接提示，零网络请求，流程结束
     ▼
 请求后端获取预签名下载 URL + 加密 File Key
@@ -113,7 +119,7 @@ Account Key unwrap File Key (AES-KW)
 File Key + AES-GCM 解密
     │
     ▼
-根据文件类型渲染 (图片 / 文本 / PDF / Word / Excel)
+根据文件类型渲染 (图片 / 文本 / PDF / Word / Excel / PPT)
 ```
 
 > 操作菜单中的"预览"入口仅对可预览类型渲染；不支持的类型只有下载/历史/重命名/删除。
@@ -363,15 +369,19 @@ LitAOSS/
 │   │   │   └── crypto.ts                 # Web Crypto 加密模块
 │   │   ├── preview/
 │   │   │   ├── registry.ts               # 预览模块注册表（扩展入口）
-│   │   │   ├── modules/                  # 各格式模块描述 (pdf/docx/xlsx)
+│   │   │   ├── modules/                  # 各格式模块描述 (pdf/docx/xlsx/pptx)
 │   │   │   └── viewers/                  # 懒加载查看器组件
 │   │   ├── api/
 │   │   │   └── client.ts                 # API 客户端
 │   │   ├── hooks/
 │   │   │   └── useCrypto.tsx             # 加密状态管理
+│   │   ├── upload/
+│   │   │   ├── walkEntries.ts            # 拖拽/选择文件与文件夹层级解析
+│   │   │   └── uploadQueue.ts            # 逐文件加密上传 + 目录链复用/创建
 │   │   ├── components/
 │   │   │   ├── LoginScreen.tsx           # 登录/初始化界面
 │   │   │   ├── FileExplorer.tsx          # 文件管理器 (核心)
+│   │   │   ├── UploadQueueDialog.tsx     # 上传队列弹窗（确认/进度/重试）
 │   │   │   ├── FilePreview.tsx           # 文件预览
 │   │   │   ├── TextEditor.tsx            # 文本编辑器
 │   │   │   └── Settings.tsx              # SecretKey 加密设置
@@ -432,7 +442,7 @@ interface PreviewModule {
 
 - `kind: 'document'` 的查看器在预览时才动态加载（Vite 代码分包），不进主包
 - 查看器只接收**本地解密后的 `ArrayBuffer`**，全程不出浏览器，符合零知识约束
-- 当前内置: 图片 / 文本 / PDF (react-pdf) / Word (docx-preview) / Excel (SheetJS)
+- 当前内置: 图片 / 文本 / PDF (react-pdf) / Word (docx-preview) / Excel (SheetJS) / PPT (pptx-renderer)
 - 自检: `frontend/preview-harness.html` + `node previewTest.mjs`（需先启动 vite dev）
 
 ### 7.3 预留扩展点

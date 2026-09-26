@@ -29,6 +29,9 @@ LitAOSS 引用了以下第三方开源软件。各依赖以其原许可证（ori
 | docx-preview | Word (.docx) 预览渲染 | Apache-2.0 |
 | jszip（docx-preview 依赖） | DOCX 压缩包解析 | MIT 或 GPL-3.0-or-later（本项目按 MIT 使用） |
 | xlsx（SheetJS Community Edition） | Excel 解析 | Apache-2.0 |
+| @aiden0z/pptx-renderer | PPT (.pptx) 解析与渲染 | Apache-2.0 |
+| echarts（pptx-renderer 依赖） | 幻灯片图表渲染 | Apache-2.0 |
+| mtx-decompressor（pptx-renderer 依赖） | 图表压缩数据解码 | MPL-2.0 |
 | clsx / dequal / tiny-invariant / warning / make-* / merge-refs 等（react-pdf 依赖） | 工具函数 | MIT |
 | 其余传递依赖 | 见 `frontend/package.json` / `frontend/package-lock.json` | 各自许可证 |
 

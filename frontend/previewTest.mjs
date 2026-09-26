@@ -73,6 +73,40 @@ try {
   });
   check('cmaps served (/cmaps/*.bcmap)', cmapStatus === 200, 'status=' + cmapStatus);
 
+  // ---- PPTX（窗口化渲染：仅挂载滚动可见的幻灯片，需滚动逐页验证）----
+  await page.waitForFunction(
+    () => (document.querySelector('#panel-pptx')?.textContent || '').includes('R0C2'),
+    null,
+    { timeout: 60000 },
+  );
+  const pptxTop = await page.$eval('#panel-pptx', (el) => el.textContent || '');
+  check('pptx 第1-2页（标题/要点/表格/中文）', pptxTop.includes('PPTX Preview Test') && pptxTop.includes('First bullet item') && pptxTop.includes('中文内容测试') && pptxTop.includes('R2C2'), pptxTop.slice(0, 150));
+
+  await page.$eval('#panel-pptx .overflow-auto', (el) => el.scrollTo({ top: el.scrollHeight * 0.55 }));
+  await page.waitForFunction(
+    () => (document.querySelector('#panel-pptx')?.textContent || '').includes('Chart Slide'),
+    null,
+    { timeout: 30000 },
+  );
+  await page
+    .waitForFunction(
+      () => document.querySelectorAll('#panel-pptx [data-slide-index="2"] canvas, #panel-pptx [data-slide-index="2"] svg').length > 0,
+      null,
+      { timeout: 30000 },
+    )
+    .catch(() => {});
+  const chartFigs = await page.$$eval('#panel-pptx [data-slide-index="2"] canvas, #panel-pptx [data-slide-index="2"] svg', (els) => els.length);
+  check('pptx 第3页图表渲染', chartFigs > 0, 'chart elements=' + chartFigs);
+
+  await page.$eval('#panel-pptx .overflow-auto', (el) => el.scrollTo({ top: el.scrollHeight }));
+  await page.waitForFunction(
+    () => (document.querySelector('#panel-pptx')?.textContent || '').includes('Shapes Slide'),
+    null,
+    { timeout: 30000 },
+  );
+  const pptxBottom = await page.$eval('#panel-pptx', (el) => el.textContent || '');
+  check('pptx 第4页图形', pptxBottom.includes('Shapes Slide') && pptxBottom.includes('Rounded Rectangle'), pptxBottom.slice(-150));
+
   await page.screenshot({ path: 'preview-harness.png', fullPage: true });
 } catch (e) {
   report.errors.push('fatal: ' + (e && e.message ? e.message : e));
