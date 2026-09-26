@@ -273,33 +273,12 @@ nssm start LitAOSS
 
 ## 5. 配置文件
 
-### 5.1 config.json 完整示例
+### 5.1 配置文件
 
-```json
-{
-  "server": {
-    "port": "8780",
-    "host": "0.0.0.0",
-    "allowed_origin": "https://your-domain.com"
-  },
-  "database": {
-    "path": "./data/lit-aoss.db"
-  },
-  "oss": {
-    "provider": "aliyun",
-    "endpoint": "https://oss-cn-hangzhou.aliyuncs.com",
-    "access_key": "your-access-key-id",
-    "secret_key": "",
-    "encrypted_sk": "加密后的 SecretKey",
-    "bucket": "your-bucket-name",
-    "region": "cn-hangzhou"
-  },
-  "auth": {
-    "pbkdf2_iterations": 500000,
-    "max_login_attempts": 5,
-    "lockout_duration_seconds": 900
-  }
-}
+完整模板见仓库中的 `backend/config.example.json`，复制后修改：
+
+```bash
+cp backend/config.example.json backend/config.json   # Windows: copy
 ```
 
 **配置说明:**
@@ -308,6 +287,7 @@ nssm start LitAOSS
 |------|------|
 | `server.allowed_origin` | 允许访问的前端域名，留空则仅允许 localhost |
 | `oss.encrypted_sk` | 加密后的 SecretKey，留空则使用明文 `secret_key` |
+| `backup.*` | 自动备份、文件变更触发、OSS 加密上传各开关 |
 
 ### 5.2 加密 SecretKey
 

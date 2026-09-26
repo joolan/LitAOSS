@@ -1,15 +1,57 @@
-# LitAOSS - 端到端加密存储系统
+# LitAOSS
 
-浏览器端加密的私有网盘，文件加密后上传到阿里云 OSS，服务端全程不接触明文和密钥。
+**端到端加密的零知识私有网盘** —— 文件在浏览器端加密后再上传阿里云 OSS，服务端全程不接触明文与密钥；没有你的主密码，拿到数据库和 OSS 密文也无法解密。
 
-## 技术栈
+![文件列表](docs/screenshots/file-list.png)
 
-| 组件 | 技术 |
-|------|------|
-| 前端 | React 18 + TypeScript + Vite + TailwindCSS |
-| 加密 | Web Crypto API (AES-256-GCM + AES-KW + PBKDF2) |
-| 后端 | Go + Gin + SQLite |
-| 存储 | 阿里云 OSS (S3 兼容) |
+## 目录
+
+- [功能特性](#功能特性)
+- [界面预览](#界面预览)
+- [安全架构](#安全架构)
+- [数据丢失与恢复（重要）](#数据丢失与恢复重要)
+- [快速开始](#快速开始)
+- [独立加密工具](#独立加密工具)
+- [数据库备份](#数据库备份)
+- [支持的预览格式](#支持的预览格式)
+- [安全说明](#安全说明)
+- [注意事项](#注意事项)
+- [文档](#文档)
+
+## 功能特性
+
+### 文件与存储
+
+- 加密后直传 OSS，服务端只见密文；下载后在本地解密
+- 文件夹管理、网格/列表视图切换、存储统计
+- 图片/文本在线预览（类型白名单 + 200MB 限制，校验不通过不发请求）
+- 文本文件在线编辑保存，自动生成版本历史，可回滚
+- 软删除：OSS 对象不物理删除，写入回收站台账，可恢复
+
+### 安全与账号
+
+- 零知识架构：主密码只在浏览器派生 Auth Hash 与 Account Key，服务端只存验证哈希
+- 改主密码只重新包装 Account Key，所有文件内容与文件名不受影响
+- Session Token 鉴权 + 可选 MFA (TOTP)；登录失败 5 次锁定 15 分钟
+- SecretKey 与数据库文件均可加密存储（scrypt / AES-256-GCM）
+- 后端版本号仅在登录成功后返回（设置页展示），匿名接口不暴露指纹
+
+### 备份与恢复
+
+- 手动 / 定时 / 文件变更三种触发的数据库快照（`VACUUM INTO` 一致性，含 WAL）
+- 可选 AES-256-GCM 加密上传 OSS 异机副本，内容未变化自动按 MD5 跳过
+- 一键恢复本地或 OSS 备份（OSS 恢复需 TOTP 验证）；恢复先暂存、重启服务端生效
+
+## 界面预览
+
+|  |  |
+|:--:|:--:|
+| <img src="docs/screenshots/login.png" alt="登录" width="440"> | <img src="docs/screenshots/file-preview.png" alt="图片预览" width="440"> |
+| <sub>登录 / 主密码解锁</sub> | <sub>图片与文本在线预览</sub> |
+| <img src="docs/screenshots/text-editor.png" alt="文本编辑" width="440"> | <img src="docs/screenshots/backup-settings.png" alt="备份设置" width="440"> |
+| <sub>文本编辑保存与版本历史</sub> | <sub>设置 → 备份与恢复</sub> |
+| <img src="docs/screenshots/encrypt-tool.png" alt="独立加密工具" width="440"> | <img src="docs/screenshots/mfa.png" alt="MFA" width="440"> |
+| <sub>独立加密/解密工具（纯浏览器端）</sub> | <sub>MFA (TOTP) 绑定与验证</sub> |
 
 ## 安全架构
 
@@ -64,43 +106,21 @@
 
 ### 1. 配置
 
-编辑 `backend/config.json`:
+复制配置模板并按需修改：
 
-```json
-{
-  "server": {
-    "port": "8780",
-    "host": "0.0.0.0",
-    "allowed_origin": "http://localhost:3000"
-  },
-  "database": {
-    "path": "./data/lit-aoss.db"
-  },
-  "oss": {
-    "provider": "aliyun",
-    "endpoint": "https://oss-cn-hangzhou.aliyuncs.com",
-    "access_key": "你的 AccessKey (明文)",
-    "secret_key": "",
-    "encrypted_sk": "加密后的 SecretKey",
-    "bucket": "你的 Bucket 名称",
-    "region": "cn-hangzhou"
-  },
-  "auth": {
-    "pbkdf2_iterations": 500000,
-    "max_login_attempts": 5,
-    "lockout_duration_seconds": 900
-  },
-  "backup": {
-    "auto_backup": false,
-    "backup_time": "03:00",
-    "on_file_change": false,
-    "min_interval_sec": 300,
-    "max_backups": 10,
-    "auto_backup_upload_oss": false,
-    "on_file_change_upload_oss": false
-  }
-}
+```bash
+cp backend/config.example.json backend/config.json   # Windows: copy
 ```
+
+至少修改这几项：
+
+| 字段 | 说明 |
+|------|------|
+| `oss.access_key` | 阿里云 AccessKey ID（明文） |
+| `oss.bucket` / `oss.endpoint` / `oss.region` | Bucket 名称与地域 |
+| `oss.encrypted_sk` | 加密后的 SecretKey（见第 3 步，初始可留空） |
+| `server.allowed_origin` | 前端访问域名（本地开发默认 `http://localhost:3000`） |
+| `backup.*` | 自动备份与 OSS 上传开关（默认全关） |
 
 ### 2. 配置加密口令
 
@@ -139,23 +159,7 @@ npm install
 npm run dev
 ```
 
-访问 http://localhost:3000
-
-## 功能
-
-- 文件上传 (加密后直传 OSS)
-- 文件下载 (从 OSS 下载后本地解密)
-- 文件夹管理
-- 文件预览 (图片、文本)
-- 文本文件编辑保存 (版本历史)
-- 网格/列表视图切换
-- 存储统计
-- SecretKey 加密存储
-- 数据库文件加密存储
-- API 鉴权 (Session Token + 可选 MFA/TOTP)
-- 独立文件加密/解密工具 (不经过服务器)
-- 数据库自动/手动备份（可选加密上传 OSS 异机副本）
-- 后端版本号展示（设置弹窗标题旁）
+访问 http://localhost:3000，首次进入会引导你设置主密码。
 
 ## 独立加密工具
 
@@ -194,7 +198,6 @@ npm run dev
 ## 安全说明
 
 - 未登录用户无法访问任何文件操作 API
-- 后端版本号仅在**登录成功**的响应中返回并在设置页展示；匿名接口与所有错误响应不携带，防止未登录指纹识别
 - Session Token 仅通过 HTTP Header 传递，不在 URL 中暴露
 - CORS 仅允许配置的来源域名访问
 - 登录失败 5 次后锁定 15 分钟；TOTP / 验证码同样有次数限制
