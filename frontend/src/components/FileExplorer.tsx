@@ -3,6 +3,7 @@ import {
   Upload, FolderPlus, Trash2, Download, Eye, Edit3, File, Image,
   ChevronRight, Home, MoreVertical, X, Save, Check, HardDrive, Folder,
   FileText, AlertCircle, FilePlus, Settings as SettingsIcon, Lock, History, Shield,
+  FileSpreadsheet,
 } from 'lucide-react';
 import { api, FileRecord, fromBase64Bytes } from '../api/client';
 import { getSessionPassword } from '../session';
@@ -11,6 +12,7 @@ import {
   encryptNameForStorage, decryptNameForStorage, isLegacyEncryptedName, rewrapLegacyFileKey,
 } from '../crypto/fileKey';
 import { getPreviewMode } from '../crypto/crypto';
+import { resolvePreview } from '../preview';
 import FilePreview from './FilePreview';
 import TextEditor from './TextEditor';
 import VersionHistory from './VersionHistory';
@@ -436,6 +438,12 @@ export default function FileExplorer({ onLock }: FileExplorerProps) {
     const mode = getPreviewMode(name);
     if (mode === 'image') return <Image className="w-8 h-8 text-purple-400" />;
     if (mode === 'text') return <FileText className="w-8 h-8 text-blue-400" />;
+    if (mode === 'document') {
+      if (resolvePreview(name)?.id === 'xlsx') {
+        return <FileSpreadsheet className="w-8 h-8 text-emerald-400" />;
+      }
+      return <FileText className="w-8 h-8 text-sky-400" />;
+    }
     return <File className="w-8 h-8 text-gray-400" />;
   };
 

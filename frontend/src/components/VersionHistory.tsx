@@ -189,7 +189,7 @@ export default function VersionHistory({ file, fileName, onClose, onChanged }: V
                   </div>
                 </div>
                 <div className="flex gap-2">
-                  {getPreviewMode(fileName) !== 'unsupported' && (
+                  {(getPreviewMode(fileName) === 'image' || getPreviewMode(fileName) === 'text') && (
                     <button
                       onClick={() => handlePreview(v)}
                       disabled={busy || previewLoading}

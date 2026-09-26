@@ -27,3 +27,4 @@ Thumbs.db
 
 # Config (contains secrets)
 backend/config.json
+frontend/preview-harness*.png

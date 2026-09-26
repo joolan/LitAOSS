@@ -9,7 +9,7 @@ LitAOSS 是一个端到端加密的私有存储系统。文件在浏览器端完
 - 文件加密在浏览器端完成，服务端仅存储密文
 - SecretKey 加密存储于配置文件，启动时自动解密
 - 数据库文件支持加密存储，停止服务后自动加密
-- 支持图片、文本文件在线预览
+- 在线预览图片、文本、PDF、Word、Excel（前端可插拔渲染，见 §7.2）
 - 支持文本文件在线编辑并加密保存
 - 单用户自用，无需多用户权限体系
 
@@ -98,7 +98,7 @@ AES-KW 包装 File Key (用 Account Key)
 #### 下载/预览流程
 
 ```
-前置检查: 类型可预览 且 size ≤ 200MB (PREVIEW_MAX_SIZE)
+前置检查: 类型可预览 且 size ≤ 类型上限（图片/文本 200MB、PDF 100MB、Word/Excel 50MB）
     │  不通过 → 直接提示，零网络请求，流程结束
     ▼
 请求后端获取预签名下载 URL + 加密 File Key
@@ -113,7 +113,7 @@ Account Key unwrap File Key (AES-KW)
 File Key + AES-GCM 解密
     │
     ▼
-根据文件类型渲染 (图片 / 文本 / 下载)
+根据文件类型渲染 (图片 / 文本 / PDF / Word / Excel)
 ```
 
 > 操作菜单中的"预览"入口仅对可预览类型渲染；不支持的类型只有下载/历史/重命名/删除。
@@ -361,6 +361,10 @@ LitAOSS/
 │   ├── src/
 │   │   ├── crypto/
 │   │   │   └── crypto.ts                 # Web Crypto 加密模块
+│   │   ├── preview/
+│   │   │   ├── registry.ts               # 预览模块注册表（扩展入口）
+│   │   │   ├── modules/                  # 各格式模块描述 (pdf/docx/xlsx)
+│   │   │   └── viewers/                  # 懒加载查看器组件
 │   │   ├── api/
 │   │   │   └── client.ts                 # API 客户端
 │   │   ├── hooks/
@@ -374,6 +378,8 @@ LitAOSS/
 │   │   ├── App.tsx                       # 主应用
 │   │   ├── main.tsx                      # 入口
 │   │   └── index.css                     # 全局样式
+│   ├── preview-harness.html              # 预览渲染自检页（开发用）
+│   ├── previewTest.mjs                   # 自检自动化脚本（开发用）
 │   ├── package.json
 │   ├── vite.config.ts
 │   └── tailwind.config.js
@@ -407,9 +413,29 @@ type Storage interface {
 
 后续可实现 `TencentCOS`、`MinIO`、`S3` 等。
 
-### 7.2 预留扩展点
+### 7.2 前端预览插件机制
+
+预览能力通过 `frontend/src/preview/` 的注册表按格式挂载，新增一种可预览格式无需改动主流程：
+
+1. 在 `preview/modules/` 新增模块描述（扩展名列表、类型、大小上限、查看器的动态 `import()`）
+2. 在 `preview/index.ts` 调用 `registerPreview()` 注册一行
+
+```ts
+interface PreviewModule {
+  id: string;                 // 模块标识
+  extensions: string[];       // 命中的扩展名
+  kind: 'image' | 'text' | 'document';   // 渲染类别
+  maxSizeBytes: number;       // 分级大小上限
+  load?: () => Promise<{ default: ComponentType<PreviewRenderProps> }>;  // 按需分包
+}
+```
+
+- `kind: 'document'` 的查看器在预览时才动态加载（Vite 代码分包），不进主包
+- 查看器只接收**本地解密后的 `ArrayBuffer`**，全程不出浏览器，符合零知识约束
+- 当前内置: 图片 / 文本 / PDF (react-pdf) / Word (docx-preview) / Excel (SheetJS)
+- 自检: `frontend/preview-harness.html` + `node previewTest.mjs`（需先启动 vite dev）
+
+### 7.3 预留扩展点
 
 - 文件分享链接 (通过 URL fragment 传递解密密钥)
-- 文件版本历史
-- 回收站
 - 搜索功能 (需对加密文件名建立索引)

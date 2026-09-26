@@ -1,3 +1,6 @@
+import '../preview';
+import { resolvePreview, PREVIEW_MAX_SIZE } from '../preview/registry';
+
 const PBKDF2_ITERATIONS = 500000;
 const SALT_LENGTH = 16;
 const IV_LENGTH = 12;
@@ -259,24 +262,11 @@ export async function decryptFileKey(accountKey: CryptoKey, encryptedKeyBase64: 
   return toBase64(rawKey);
 }
 
-export const PREVIEW_MAX_SIZE = 200 * 1024 * 1024;
+export { PREVIEW_MAX_SIZE };
 
-export function getPreviewMode(filename: string): 'image' | 'text' | 'unsupported' {
-  const ext = filename.split('.').pop()?.toLowerCase() || '';
-
-  const imageExts = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'bmp', 'ico', 'tiff', 'tif'];
-  if (imageExts.includes(ext)) return 'image';
-
-  const textExts = [
-    'txt', 'json', 'xml', 'csv', 'log', 'md', 'yaml', 'yml', 'toml', 'ini', 'conf',
-    'js', 'ts', 'jsx', 'tsx', 'py', 'go', 'java', 'c', 'cpp', 'h', 'hpp', 'rb', 'rs',
-    'sh', 'bash', 'zsh', 'sql', 'html', 'htm', 'css', 'scss', 'less', 'vue', 'svelte',
-    'env', 'gitignore', 'dockerignore', 'makefile', 'cmake', 'gradle', 'properties',
-    'proto', 'graphql', 'tf', 'hcl', 'nginx', 'apache',
-  ];
-  if (textExts.includes(ext)) return 'text';
-
-  return 'unsupported';
+export function getPreviewMode(filename: string): 'image' | 'text' | 'document' | 'unsupported' {
+  const preview = resolvePreview(filename);
+  return preview ? preview.kind : 'unsupported';
 }
 
 export function isTextFile(filename: string): boolean {

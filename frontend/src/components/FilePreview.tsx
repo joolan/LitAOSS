@@ -1,8 +1,7 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, type ComponentType } from 'react';
 import { X, Download, ZoomIn, ZoomOut, RotateCcw } from 'lucide-react';
-import { FileRecord, fromBase64Bytes } from '../api/client';
-import { unwrapFileKeyFromStorage } from '../crypto/fileKey';
-import { getPreviewMode, PREVIEW_MAX_SIZE } from '../crypto/crypto';
+import { FileRecord } from '../api/client';
+import { resolvePreview, decryptFileContent, type PreviewRenderProps } from '../preview';
 
 interface FilePreviewProps {
   file: FileRecord;
@@ -11,11 +10,15 @@ interface FilePreviewProps {
 }
 
 export default function FilePreview({ file, fileName, onClose }: FilePreviewProps) {
-  const [content, setContent] = useState<string | null>(null);
+  const [textContent, setTextContent] = useState<string | null>(null);
   const [imageUrl, setImageUrl] = useState<string | null>(null);
+  const [plaintext, setPlaintext] = useState<ArrayBuffer | null>(null);
+  const [Viewer, setViewer] = useState<ComponentType<PreviewRenderProps> | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [zoom, setZoom] = useState(100);
+
+  const preview = resolvePreview(fileName);
 
   useEffect(() => {
     loadContent();
@@ -28,46 +31,34 @@ export default function FilePreview({ file, fileName, onClose }: FilePreviewProp
     setLoading(true);
     setError('');
 
-    const mode = getPreviewMode(fileName);
-    if (mode === 'unsupported') {
+    if (!preview) {
       setError('不支持预览此文件类型');
       setLoading(false);
       return;
     }
-    if (file.file_size > PREVIEW_MAX_SIZE) {
-      setError(`文件太大（${(file.file_size / 1024 / 1024).toFixed(1)} MB），超过 200MB 不支持预览`);
+    if (file.file_size > preview.maxSizeBytes) {
+      const limitMb = Math.round(preview.maxSizeBytes / 1024 / 1024);
+      setError(
+        `文件太大（${(file.file_size / 1024 / 1024).toFixed(1)} MB），超过 ${limitMb}MB 不支持预览`,
+      );
       setLoading(false);
       return;
     }
 
     try {
-      const { api: apiClient } = await import('../api/client');
-      const presignRes = await apiClient.getPresignDownloadUrl(file.oss_key);
-      const response = await fetch(presignRes.url);
-      const ciphertext = await response.arrayBuffer();
+      const content = await decryptFileContent(file);
 
-      const fileKeyRaw = await unwrapFileKeyFromStorage(file.encrypted_file_key || '');
-      const fileKey = await crypto.subtle.importKey(
-        'raw',
-        fileKeyRaw,
-        { name: 'AES-GCM', length: 256 },
-        false,
-        ['decrypt'],
-      );
-
-      const iv = fromBase64Bytes(file.iv);
-      const plaintext = await crypto.subtle.decrypt(
-        { name: 'AES-GCM', iv, tagLength: 128 },
-        fileKey,
-        ciphertext,
-      );
-
-      if (mode === 'image') {
-        const blob = new Blob([plaintext], { type: file.file_type || 'image/png' });
+      if (preview.kind === 'image') {
+        const blob = new Blob([content], { type: file.file_type || 'image/png' });
         setImageUrl(URL.createObjectURL(blob));
+      } else if (preview.kind === 'text') {
+        setTextContent(new TextDecoder().decode(content));
       } else {
-        const text = new TextDecoder().decode(plaintext);
-        setContent(text);
+        setPlaintext(content);
+        if (preview.load) {
+          const mod = await preview.load();
+          setViewer(() => mod.default);
+        }
       }
     } catch (err) {
       setError('解密失败: ' + (err as Error).message);
@@ -78,28 +69,8 @@ export default function FilePreview({ file, fileName, onClose }: FilePreviewProp
 
   const handleDownload = async () => {
     try {
-      const { api: apiClient } = await import('../api/client');
-      const presignRes = await apiClient.getPresignDownloadUrl(file.oss_key);
-      const response = await fetch(presignRes.url);
-      const ciphertext = await response.arrayBuffer();
-
-      const fileKeyRaw = await unwrapFileKeyFromStorage(file.encrypted_file_key || '');
-      const fileKey = await crypto.subtle.importKey(
-        'raw',
-        fileKeyRaw,
-        { name: 'AES-GCM', length: 256 },
-        false,
-        ['decrypt'],
-      );
-
-      const iv = fromBase64Bytes(file.iv);
-      const plaintext = await crypto.subtle.decrypt(
-        { name: 'AES-GCM', iv, tagLength: 128 },
-        fileKey,
-        ciphertext,
-      );
-
-      const blob = new Blob([plaintext], { type: file.file_type || 'application/octet-stream' });
+      const content = await decryptFileContent(file);
+      const blob = new Blob([content], { type: file.file_type || 'application/octet-stream' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
@@ -110,6 +81,8 @@ export default function FilePreview({ file, fileName, onClose }: FilePreviewProp
       alert('下载失败');
     }
   };
+
+  const showZoom = preview?.kind === 'text';
 
   return (
     <div className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4" onClick={onClose}>
@@ -123,9 +96,14 @@ export default function FilePreview({ file, fileName, onClose }: FilePreviewProp
             <span className="text-xs text-gray-500 flex-shrink-0">
               {(file.file_size / 1024).toFixed(1)} KB
             </span>
+            {preview && preview.kind === 'document' && (
+              <span className="text-xs px-1.5 py-0.5 rounded bg-gray-800 text-gray-400 flex-shrink-0">
+                {preview.label}
+              </span>
+            )}
           </div>
           <div className="flex items-center gap-2">
-            {getPreviewMode(fileName) === 'text' && (
+            {showZoom && (
               <>
                 <button
                   onClick={() => setZoom(Math.max(50, zoom - 10))}
@@ -170,7 +148,7 @@ export default function FilePreview({ file, fileName, onClose }: FilePreviewProp
               解密中...
             </div>
           ) : error ? (
-            <div className="flex items-center justify-center h-64 text-red-400">
+            <div className="flex items-center justify-center h-64 text-red-400 text-center px-4">
               {error}
             </div>
           ) : imageUrl ? (
@@ -182,13 +160,17 @@ export default function FilePreview({ file, fileName, onClose }: FilePreviewProp
                 style={{ transform: `scale(${zoom / 100})` }}
               />
             </div>
-          ) : content !== null ? (
+          ) : textContent !== null ? (
             <pre
               className="text-sm text-gray-300 font-mono whitespace-pre-wrap break-words"
               style={{ fontSize: `${zoom}%` }}
             >
-              {content}
+              {textContent}
             </pre>
+          ) : Viewer && plaintext ? (
+            <div className="h-[70vh]">
+              <Viewer fileName={fileName} data={plaintext} />
+            </div>
           ) : null}
         </div>
       </div>
