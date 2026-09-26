@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { api, setSessionToken } from './api/client';
 import { deriveMasterKey, unwrapAccountKey } from './crypto/crypto';
 import { setUnlockMaterial, clearUnlockMaterial } from './session';
@@ -169,6 +169,39 @@ export default function App() {
     setAccountKey(null);
     setState('login');
   };
+
+  // 安全机制：30 分钟无操作自动退出登录。
+  // 计时从最后一次真实输入算起；最小化浏览器 / 锁屏等离屏时段不产生输入、
+  // 不重置计时（后台定时器与可见性校验保证离屏超时同样生效）。
+  const IDLE_TIMEOUT_MS = 30 * 60 * 1000;
+  const lockRef = useRef(handleLock);
+  lockRef.current = handleLock;
+
+  useEffect(() => {
+    if (state !== 'unlocked') return;
+
+    let lastActivity = Date.now();
+    const markActivity = () => { lastActivity = Date.now(); };
+    const checkIdle = () => {
+      if (Date.now() - lastActivity >= IDLE_TIMEOUT_MS) {
+        void lockRef.current();
+      }
+    };
+    const onVisibility = () => {
+      if (!document.hidden) checkIdle();
+    };
+
+    const activityEvents = ['pointerdown', 'pointermove', 'keydown', 'wheel', 'touchstart'];
+    activityEvents.forEach((e) => window.addEventListener(e, markActivity, { passive: true }));
+    document.addEventListener('visibilitychange', onVisibility);
+    const timer = window.setInterval(checkIdle, 30_000);
+
+    return () => {
+      activityEvents.forEach((e) => window.removeEventListener(e, markActivity));
+      document.removeEventListener('visibilitychange', onVisibility);
+      window.clearInterval(timer);
+    };
+  }, [state]);
 
   if (state === 'loading') {
     return (

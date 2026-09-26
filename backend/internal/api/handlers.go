@@ -185,6 +185,9 @@ func (h *Handler) Login(c *gin.Context) {
 		token = h.sessions.Create()
 	}
 
+	// 单会话在线：新登录成功即踢下线此前的所有会话（含停留在 MFA 验证页的会话）
+	h.sessions.DeleteAllExcept(token)
+
 	c.JSON(http.StatusOK, models.LoginResponse{
 		OK:                 true,
 		EncryptedAccountKey: encKey,
