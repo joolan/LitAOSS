@@ -1,0 +1,29 @@
+# Backend
+backend/data/
+backend/lit-aoss-server
+backend/*.exe
+*.log
+server.err.log
+
+# Secrets (never commit)
+backend/config.json
+backend/passphrase.txt
+passphrase.txt
+.env
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Config (contains secrets)
+backend/config.json
