@@ -2,12 +2,20 @@ package api
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/base32"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
+	"regexp"
+	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -24,6 +32,12 @@ import (
 const (
 	maxTOTPAttempts     = 5
 	totpLockoutDuration = 15 * time.Minute
+)
+
+// fileOSSKeyPattern 仅放行 GenerateOSSKey 生成的对象键（files/<uuid>/<hex>.enc），
+// 防止持会话者对桶内任意前缀（如 db-backups/）申请预签名读写。
+var fileOSSKeyPattern = regexp.MustCompile(
+	`^files/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/[0-9a-f]{72}\.enc$`,
 )
 
 type Handler struct {
@@ -157,6 +171,8 @@ func (h *Handler) Login(c *gin.Context) {
 	}
 
 	h.db.RecordLoginAttempt(ip, true)
+	// 全局锁定约定：登录成功即清零失败累计，历史失败不影响后续登录
+	h.db.ClearFailedLoginAttempts()
 
 	encKey, err := h.db.GetEncryptedAccountKey()
 	if err != nil {
@@ -213,6 +229,15 @@ func (h *Handler) GetSalt(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"salt": salt})
+}
+
+func (h *Handler) GetLoginHistory(c *gin.Context) {
+	attempts, err := h.db.GetLoginHistory(50)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, models.MessageResponse{OK: false, Error: "failed to load history"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"attempts": attempts})
 }
 
 func (h *Handler) UpdateKey(c *gin.Context) {
@@ -372,6 +397,7 @@ func (h *Handler) CreateFileRecord(c *gin.Context) {
 		EncryptedFileKey: req.EncryptedFileKey,
 		IV:               req.IV,
 		Salt:             req.Salt,
+		ContentHash:      req.ContentHash,
 		CreatedAt:        time.Now(),
 		UpdatedAt:        time.Now(),
 	}
@@ -394,13 +420,14 @@ func (h *Handler) UpdateFileContent(c *gin.Context) {
 		IV               []byte `json:"iv" binding:"required"`
 		Salt             []byte `json:"salt"`
 		OSSKey           string `json:"oss_key" binding:"required"`
+		ContentHash      string `json:"content_hash"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, models.MessageResponse{OK: false, Error: "invalid request"})
 		return
 	}
 
-	if err := h.db.UpdateFileContent(id, req.FileSize, req.FileType, req.EncryptedFileKey, req.IV, req.Salt, req.OSSKey); err != nil {
+	if err := h.db.UpdateFileContent(id, req.FileSize, req.FileType, req.EncryptedFileKey, req.IV, req.Salt, req.OSSKey, req.ContentHash); err != nil {
 		c.JSON(http.StatusInternalServerError, models.MessageResponse{OK: false, Error: err.Error()})
 		return
 	}
@@ -409,10 +436,37 @@ func (h *Handler) UpdateFileContent(c *gin.Context) {
 	c.JSON(http.StatusOK, models.MessageResponse{OK: true})
 }
 
+// CheckDedup 内容寻址查重：客户端提交内容哈希，命中则返回既有文件的
+// 密钥封装字段，客户端可跳过 OSS 上传、复用同一密文对象建记录。
+func (h *Handler) CheckDedup(c *gin.Context) {
+	var req struct {
+		ContentHash string `json:"content_hash" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, models.MessageResponse{OK: false, Error: "invalid request"})
+		return
+	}
+
+	existing, err := h.db.FindFileByContentHash(req.ContentHash)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			c.JSON(http.StatusOK, gin.H{"found": false})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, models.MessageResponse{OK: false, Error: err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"found": true, "file": existing})
+}
+
 func (h *Handler) PresignUpload(c *gin.Context) {
 	var req models.PresignRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := c.ShouldBindJSON(&req); err != nil || req.OSSKey == "" {
 		c.JSON(http.StatusBadRequest, models.PresignResponse{})
+		return
+	}
+	if !fileOSSKeyPattern.MatchString(req.OSSKey) {
+		c.JSON(http.StatusBadRequest, models.MessageResponse{OK: false, Error: "invalid oss_key"})
 		return
 	}
 
@@ -432,8 +486,12 @@ func (h *Handler) PresignUpload(c *gin.Context) {
 
 func (h *Handler) PresignDownload(c *gin.Context) {
 	var req models.PresignRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := c.ShouldBindJSON(&req); err != nil || req.OSSKey == "" {
 		c.JSON(http.StatusBadRequest, models.PresignResponse{})
+		return
+	}
+	if !fileOSSKeyPattern.MatchString(req.OSSKey) {
+		c.JSON(http.StatusBadRequest, models.MessageResponse{OK: false, Error: "invalid oss_key"})
 		return
 	}
 
@@ -575,6 +633,11 @@ func (h *Handler) GenerateOSSKey(c *gin.Context) {
 	if folder == "" {
 		folder = "files"
 	}
+	// 仅允许文件命名空间；备份对象键由后端自行生成，不经此接口
+	if folder != "files" {
+		c.JSON(http.StatusBadRequest, models.MessageResponse{OK: false, Error: "invalid folder"})
+		return
+	}
 
 	key := fmt.Sprintf("%s/%s/%s.enc", folder, uuid.New().String(), hex.EncodeToString([]byte(uuid.New().String())))
 	c.JSON(http.StatusOK, gin.H{"oss_key": key})
@@ -600,6 +663,65 @@ func (h *Handler) GetFileInfo(c *gin.Context) {
 		"is_directory":     file.IsDirectory,
 		"parent_id":        file.ParentID,
 	})
+}
+
+// MoveFile 将文件/文件夹移动到指定目录（parent_id 为空/null 表示根目录）。
+// 校验目标存在且为文件夹；移动文件夹时拒绝移动到自身或自身的后代（防环）。
+func (h *Handler) MoveFile(c *gin.Context) {
+	id := c.Param("id")
+	var req struct {
+		ParentID *string `json:"parent_id"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, models.MessageResponse{OK: false, Error: err.Error()})
+		return
+	}
+
+	file, err := h.db.GetFile(id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, models.MessageResponse{OK: false, Error: "file not found"})
+		return
+	}
+
+	if req.ParentID != nil {
+		if *req.ParentID == id {
+			c.JSON(http.StatusBadRequest, models.MessageResponse{OK: false, Error: "不能移动到自身"})
+			return
+		}
+		parent, err := h.db.GetFile(*req.ParentID)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, models.MessageResponse{OK: false, Error: "目标文件夹不存在"})
+			return
+		}
+		if !parent.IsDirectory {
+			c.JSON(http.StatusBadRequest, models.MessageResponse{OK: false, Error: "目标不是文件夹"})
+			return
+		}
+		if file.IsDirectory {
+			for cur, depth := parent, 0; cur != nil && depth < 256; depth++ {
+				if cur.ID == id {
+					c.JSON(http.StatusBadRequest, models.MessageResponse{OK: false, Error: "不能移动到自身的子文件夹"})
+					return
+				}
+				if cur.ParentID == nil {
+					break
+				}
+				next, err := h.db.GetFile(*cur.ParentID)
+				if err != nil {
+					break
+				}
+				cur = next
+			}
+		}
+	}
+
+	if err := h.db.UpdateFileParent(id, req.ParentID); err != nil {
+		c.JSON(http.StatusInternalServerError, models.MessageResponse{OK: false, Error: err.Error()})
+		return
+	}
+
+	h.triggerBackup()
+	c.JSON(http.StatusOK, models.MessageResponse{OK: true})
 }
 
 func (h *Handler) BatchDelete(c *gin.Context) {
@@ -662,8 +784,128 @@ func (h *Handler) GetStorageStats(c *gin.Context) {
 	})
 }
 
+type statBucket struct {
+	Count int   `json:"count"`
+	Size  int64 `json:"size"`
+}
+
+// GetStatsSummary 全库统计：总量、类型分布、顶层目录占用 Top 10。
+// 目录名返回加密形态，由客户端解密后展示（零知识不变）。
+func (h *Handler) GetStatsSummary(c *gin.Context) {
+	rows, err := h.db.GetFileStatRows()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, models.MessageResponse{OK: false, Error: err.Error()})
+		return
+	}
+
+	totalSize := int64(0)
+	fileCount, folderCount := 0, 0
+	typeAgg := map[string]*statBucket{}
+	dirNames := map[string]string{}
+	parentOf := map[string]*string{}
+
+	for i := range rows {
+		r := &rows[i]
+		parentOf[r.ID] = r.ParentID
+		if r.IsDirectory {
+			folderCount++
+			dirNames[r.ID] = r.NameEncrypted
+			continue
+		}
+		fileCount++
+		totalSize += r.FileSize
+		key := r.FileType
+		if key == "" {
+			key = "unknown"
+		}
+		if typeAgg[key] == nil {
+			typeAgg[key] = &statBucket{}
+		}
+		typeAgg[key].Count++
+		typeAgg[key].Size += r.FileSize
+	}
+
+	// 每个文件向上走到顶层目录，累计到该目录（根目录散文件归入 ""）
+	dirAgg := map[string]*statBucket{}
+	for i := range rows {
+		r := &rows[i]
+		if r.IsDirectory {
+			continue
+		}
+		cur := r.ParentID
+		var root *string
+		for depth := 0; cur != nil && depth < 256; depth++ {
+			root = cur
+			pp := parentOf[*cur]
+			if pp == nil {
+				break
+			}
+			cur = pp
+		}
+		key := ""
+		if root != nil {
+			key = *root
+		}
+		if dirAgg[key] == nil {
+			dirAgg[key] = &statBucket{}
+		}
+		dirAgg[key].Count++
+		dirAgg[key].Size += r.FileSize
+	}
+
+	types := make([]gin.H, 0, len(typeAgg))
+	for k, v := range typeAgg {
+		types = append(types, gin.H{"file_type": k, "count": v.Count, "size": v.Size})
+	}
+	sort.Slice(types, func(i, j int) bool {
+		return types[i]["size"].(int64) > types[j]["size"].(int64)
+	})
+
+	topDirs := make([]gin.H, 0, len(dirAgg))
+	for id, v := range dirAgg {
+		name := ""
+		if id != "" {
+			name = dirNames[id]
+		}
+		topDirs = append(topDirs, gin.H{
+			"id": id, "name_encrypted": name, "count": v.Count, "size": v.Size,
+		})
+	}
+	sort.Slice(topDirs, func(i, j int) bool {
+		return topDirs[i]["size"].(int64) > topDirs[j]["size"].(int64)
+	})
+	if len(topDirs) > 10 {
+		topDirs = topDirs[:10]
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"totals": gin.H{
+			"total_size":   totalSize,
+			"file_count":   fileCount,
+			"folder_count": folderCount,
+		},
+		"types":    types,
+		"top_dirs": topDirs,
+	})
+}
+
+// GetLoginStats 近 N 天（默认 30，上限 90）每日成功登录次数
+func (h *Handler) GetLoginStats(c *gin.Context) {
+	days, _ := strconv.Atoi(c.DefaultQuery("days", "30"))
+	if days < 1 || days > 90 {
+		days = 30
+	}
+	list, err := h.db.GetLoginSuccessDaily(days)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, models.MessageResponse{OK: false, Error: err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"days": list})
+}
+
 func (h *Handler) CORS() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		c.Writer.Header().Add("Vary", "Origin")
 		origin := c.GetHeader("Origin")
 		allowedOrigins := map[string]bool{
 			"http://localhost:3000":  true,
@@ -695,12 +937,6 @@ func (h *Handler) CORS() gin.HandlerFunc {
 	}
 }
 
-func (h *Handler) RateLimit() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		c.Next()
-	}
-}
-
 func (h *Handler) SecurityHeaders() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Writer.Header().Set("X-Content-Type-Options", "nosniff")
@@ -708,7 +944,7 @@ func (h *Handler) SecurityHeaders() gin.HandlerFunc {
 		c.Writer.Header().Set("X-XSS-Protection", "1; mode=block")
 		c.Writer.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
 		c.Writer.Header().Set("Content-Security-Policy",
-			"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "+
+			"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "+
 				"img-src 'self' data: blob: https://*.aliyuncs.com; font-src 'self' data:; "+
 				"connect-src 'self' https://*.aliyuncs.com; object-src 'none'; "+
 				"frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
@@ -770,11 +1006,37 @@ func (h *Handler) DecryptSecret(c *gin.Context) {
 }
 
 func (h *Handler) MFASetup(c *gin.Context) {
+	var req struct {
+		PasswordHash string `json:"password_hash" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, models.MessageResponse{OK: false, Error: "invalid request"})
+		return
+	}
+
 	// 已启用时拒绝重新生成密钥：SetupMFA 会将 enabled 置 0，等于静默关闭 MFA
 	if mfaRecord, _ := h.db.GetMFA(); mfaRecord != nil && mfaRecord.Enabled {
 		c.JSON(http.StatusConflict, models.MFASetupResponse{OK: false, Error: "MFA already enabled, disable it first"})
 		return
 	}
+
+	// 重置 TOTP 密钥必须证明持有主密码：仅凭会话（如会话被盗）不得偷换认证器
+	failedCount, _ := h.db.GetFailedVerificationCount(totpLockoutDuration)
+	if failedCount >= maxTOTPAttempts {
+		c.JSON(http.StatusTooManyRequests, models.MessageResponse{
+			OK:    false,
+			Error: fmt.Sprintf("too many failed attempts, try again in %d minutes", int(totpLockoutDuration.Minutes())),
+		})
+		return
+	}
+
+	ok, err := h.db.VerifyPassword(req.PasswordHash)
+	if err != nil || !ok {
+		h.db.RecordVerificationAttempt(false)
+		c.JSON(http.StatusBadRequest, models.MessageResponse{OK: false, Error: "invalid password"})
+		return
+	}
+	h.db.RecordVerificationAttempt(true)
 
 	secret, uri, err := GenerateTOTPSecret()
 	if err != nil {
@@ -909,10 +1171,13 @@ func (h *Handler) MFAStatus(c *gin.Context) {
 	if err == nil && mfaRecord != nil {
 		enabled = mfaRecord.Enabled
 	}
+	total, remaining, _ := h.db.CountRecoveryCodes()
 
 	c.JSON(http.StatusOK, models.MFAStatusResponse{
-		OK:      true,
-		Enabled: enabled,
+		OK:                true,
+		Enabled:           enabled,
+		RecoveryTotal:     total,
+		RecoveryRemaining: remaining,
 	})
 }
 
@@ -957,6 +1222,153 @@ func (h *Handler) VerifyTOTPEndpoint(c *gin.Context) {
 	if !VerifyTOTP(mfaRecord.Secret, req.Code) {
 		h.db.RecordTOTPAttempt(false)
 		c.JSON(http.StatusBadRequest, models.MessageResponse{OK: false, Error: "invalid TOTP code"})
+		return
+	}
+
+	h.db.RecordTOTPAttempt(true)
+	h.sessions.CompleteMFA(token)
+
+	c.JSON(http.StatusOK, models.MessageResponse{OK: true})
+}
+
+const recoveryCodeCount = 10
+
+// normalizeRecoveryCode 统一为纯大写字母+数字（容忍大小写、横线、空格粘贴）
+func normalizeRecoveryCode(code string) string {
+	var b strings.Builder
+	for _, r := range strings.ToUpper(code) {
+		if (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// hashRecoveryCode SHA-256(规范化码) 的十六进制。
+// 码为 96 bit 密码学随机值，服务端只存哈希，离线暴力枚举不可行（零知识口径不受影响）。
+func hashRecoveryCode(code string) string {
+	sum := sha256.Sum256([]byte(normalizeRecoveryCode(code)))
+	return hex.EncodeToString(sum[:])
+}
+
+// generateRecoveryCode 生成形如 ABCD-EFGH-JKLM-NPQR-STUV 的 96-bit 恢复码
+func generateRecoveryCode() (plain string, hash string, err error) {
+	buf := make([]byte, 12)
+	if _, err = rand.Read(buf); err != nil {
+		return "", "", err
+	}
+	s := base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(buf)
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if i > 0 && i%4 == 0 {
+			b.WriteByte('-')
+		}
+		b.WriteByte(s[i])
+	}
+	plain = b.String()
+	return plain, hashRecoveryCode(plain), nil
+}
+
+// GenerateRecoveryCodes 生成（或整体重新生成）10 个一次性 MFA 恢复码，明文仅本次返回。
+// 重新生成即令旧码全部失效。需完整会话、MFA 已启用，且必须证明持有主密码：
+// 恢复码是长期 MFA 凭证，与 mfa/setup、mfa/disable 同策略，防止仅持会话
+// 预置自己的恢复码或静默作废号主的找回码。
+func (h *Handler) GenerateRecoveryCodes(c *gin.Context) {
+	var req struct {
+		PasswordHash string `json:"password_hash" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, models.MessageResponse{OK: false, Error: "invalid request"})
+		return
+	}
+
+	mfaRecord, err := h.db.GetMFA()
+	if err != nil || mfaRecord == nil || !mfaRecord.Enabled {
+		c.JSON(http.StatusBadRequest, models.MessageResponse{OK: false, Error: "MFA not enabled"})
+		return
+	}
+
+	failedCount, _ := h.db.GetFailedVerificationCount(totpLockoutDuration)
+	if failedCount >= maxTOTPAttempts {
+		c.JSON(http.StatusTooManyRequests, models.MessageResponse{
+			OK:    false,
+			Error: fmt.Sprintf("too many failed attempts, try again in %d minutes", int(totpLockoutDuration.Minutes())),
+		})
+		return
+	}
+
+	ok, err := h.db.VerifyPassword(req.PasswordHash)
+	if err != nil || !ok {
+		h.db.RecordVerificationAttempt(false)
+		c.JSON(http.StatusBadRequest, models.MessageResponse{OK: false, Error: "invalid password"})
+		return
+	}
+	h.db.RecordVerificationAttempt(true)
+
+	codes := make([]string, 0, recoveryCodeCount)
+	hashes := make([]string, 0, recoveryCodeCount)
+	for i := 0; i < recoveryCodeCount; i++ {
+		plain, hash, genErr := generateRecoveryCode()
+		if genErr != nil {
+			c.JSON(http.StatusInternalServerError, models.MessageResponse{OK: false, Error: genErr.Error()})
+			return
+		}
+		codes = append(codes, plain)
+		hashes = append(hashes, hash)
+	}
+	if err := h.db.ReplaceRecoveryCodes(hashes); err != nil {
+		c.JSON(http.StatusInternalServerError, models.MessageResponse{OK: false, Error: err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true, "codes": codes, "total": len(codes)})
+}
+
+// VerifyRecoveryCode 恢复码验证：与 TOTP 共用 pending 会话流转与失败锁定；
+// 命中即原子消费（一次性），已用过的码再提交按失败计数。
+func (h *Handler) VerifyRecoveryCode(c *gin.Context) {
+	token := c.GetHeader("X-Session-Token")
+	if token == "" {
+		c.JSON(http.StatusUnauthorized, models.MessageResponse{OK: false, Error: "unauthorized"})
+		return
+	}
+	if !h.sessions.Validate(token) {
+		c.JSON(http.StatusUnauthorized, models.MessageResponse{OK: false, Error: "invalid or expired session"})
+		return
+	}
+	if !h.sessions.IsPendingMFA(token) {
+		c.JSON(http.StatusOK, models.MessageResponse{OK: true})
+		return
+	}
+
+	var req models.TOTPVerifyRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, models.MessageResponse{OK: false, Error: "invalid request"})
+		return
+	}
+
+	failedCount, _ := h.db.GetFailedTOTPCount(totpLockoutDuration)
+	if failedCount >= maxTOTPAttempts {
+		c.JSON(http.StatusTooManyRequests, models.MessageResponse{
+			OK:    false,
+			Error: fmt.Sprintf("too many failed TOTP attempts, try again in %d minutes", int(totpLockoutDuration.Minutes())),
+		})
+		return
+	}
+
+	mfaRecord, err := h.db.GetMFA()
+	if err != nil || mfaRecord == nil || !mfaRecord.Enabled {
+		c.JSON(http.StatusBadRequest, models.MessageResponse{OK: false, Error: "MFA not enabled"})
+		return
+	}
+
+	ok, err := h.db.ConsumeRecoveryCode(hashRecoveryCode(req.Code))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, models.MessageResponse{OK: false, Error: "recovery verification failed"})
+		return
+	}
+	if !ok {
+		h.db.RecordTOTPAttempt(false)
+		c.JSON(http.StatusBadRequest, models.MessageResponse{OK: false, Error: "invalid or already used recovery code"})
 		return
 	}
 

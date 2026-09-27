@@ -58,6 +58,24 @@ export interface SetupStatus {
   setup_complete: boolean;
 }
 
+export interface LoginAttempt {
+  id: number;
+  ip_address: string;
+  success: boolean;
+  created_at: string;
+}
+
+export interface StatsSummary {
+  totals: { total_size: number; file_count: number; folder_count: number };
+  types: { file_type: string; count: number; size: number }[];
+  top_dirs: { id: string; name_encrypted: string; count: number; size: number }[];
+}
+
+export interface LoginDayCount {
+  day: string;
+  count: number;
+}
+
 export interface LoginResponse {
   ok: boolean;
   encrypted_account_key?: string;
@@ -157,10 +175,17 @@ export const api = {
     iv: number[] | string;
     salt: number[] | string;
     oss_key: string;
+    content_hash?: string;
   }) => request<FileRecord>('/files', {
     method: 'POST',
     body: JSON.stringify(data),
   }),
+
+  checkDedup: (contentHash: string) =>
+    request<{ found: boolean; file?: FileRecord }>('/files/dedup-check', {
+      method: 'POST',
+      body: JSON.stringify({ content_hash: contentHash }),
+    }),
 
   updateFileContent: (id: string, data: {
     file_size: number;
@@ -169,6 +194,7 @@ export const api = {
     iv: number[] | string;
     salt: number[] | string;
     oss_key: string;
+    content_hash?: string;
   }) => request<{ ok: boolean }>(`/files/${id}/content`, {
     method: 'PUT',
     body: JSON.stringify(data),
@@ -178,6 +204,12 @@ export const api = {
     request<{ ok: boolean }>('/files/' + id + '/rename', {
       method: 'PUT',
       body: JSON.stringify({ id, name_encrypted: nameEncrypted }),
+    }),
+
+  moveFile: (id: string, parentId?: string | null) =>
+    request<{ ok: boolean }>('/files/' + id + '/move', {
+      method: 'PUT',
+      body: JSON.stringify({ parent_id: parentId ?? null }),
     }),
 
   deleteFile: (id: string) =>
@@ -215,6 +247,12 @@ export const api = {
 
   getStats: () => request<{ total_size: number; file_count: number; folder_count: number }>('/stats'),
 
+  getLoginHistory: () => request<{ attempts: LoginAttempt[] }>('/auth/login-history'),
+
+  getStatsSummary: () => request<StatsSummary>('/stats/summary'),
+
+  getLoginStats: () => request<{ days: LoginDayCount[] }>('/auth/login-stats'),
+
   updateKey: (data: { encrypted_account_key: string; password_hash: string }) =>
     request<{ ok: boolean }>('/auth/update-key', {
       method: 'POST',
@@ -233,9 +271,16 @@ export const api = {
       body: JSON.stringify(data),
     }),
 
-  mfaStatus: () => request<{ enabled: boolean; setup: boolean }>('/mfa/status'),
+  mfaStatus: () =>
+    request<{ enabled: boolean; setup: boolean; recovery_total: number; recovery_remaining: number }>(
+      '/mfa/status',
+    ),
 
-  mfaSetup: () => request<{ secret: string; uri: string }>('/mfa/setup', { method: 'POST' }),
+  mfaSetup: (data: { password_hash: string }) =>
+    request<{ secret: string; uri: string }>('/mfa/setup', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
 
   mfaEnable: (data: { code: string }) =>
     request<{ ok: boolean; error?: string }>('/mfa/enable', {
@@ -245,6 +290,18 @@ export const api = {
 
   mfaDisable: (data: { code: string; password_hash: string }) =>
     request<{ ok: boolean; error?: string }>('/mfa/disable', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+
+  generateRecoveryCodes: (data: { password_hash: string }) =>
+    request<{ ok: boolean; codes: string[]; total: number }>('/mfa/recovery-codes', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+
+  verifyRecovery: (data: { code: string; session_token: string }) =>
+    request<{ ok: boolean; error?: string }>('/auth/verify-recovery', {
       method: 'POST',
       body: JSON.stringify(data),
     }),
@@ -300,6 +357,12 @@ export const api = {
       body: JSON.stringify({ oss_key: ossKey }),
     }),
 
+  backupDrill: (name?: string) =>
+    request<{ ok: boolean; report?: DrillReport; error?: string }>('/backup/drill', {
+      method: 'POST',
+      body: JSON.stringify({ name: name ?? '' }),
+    }),
+
   encryptSecret: (data: { plaintext: string; passphrase: string }) =>
     request<{ encrypted: string }>('/secret/encrypt', {
       method: 'POST',
@@ -343,4 +406,22 @@ export interface OSSBackupSummary {
   md5: string;
   file_size: number;
   uploaded_at: string;
+}
+
+export interface DrillCheck {
+  name: string;
+  ok: boolean;
+  detail: string;
+}
+
+export interface DrillReport {
+  ok: boolean;
+  name: string;
+  size: number;
+  created_at: string;
+  checks: DrillCheck[];
+  file_count: number;
+  folder_count: number;
+  duration_ms: number;
+  error?: string;
 }

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"lit-aoss/internal/models"
@@ -80,6 +81,7 @@ func (d *Database) migrate() error {
 			encrypted_file_key BLOB,
 			iv BLOB,
 			salt BLOB,
+			content_hash TEXT,
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 			deleted_at DATETIME,
@@ -133,12 +135,39 @@ func (d *Database) migrate() error {
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_totp_attempts_session ON totp_attempts(session_token, created_at)`,
+		`CREATE TABLE IF NOT EXISTS mfa_recovery_codes (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			code_hash TEXT NOT NULL,
+			used_at TEXT,
+			created_at TEXT NOT NULL DEFAULT (datetime('now'))
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_mfa_recovery_codes_hash ON mfa_recovery_codes(code_hash)`,
 	}
 
 	for _, q := range queries {
 		if _, err := d.conn.Exec(q); err != nil {
 			return fmt.Errorf("exec migration: %w", err)
 		}
+	}
+
+	// 既有库补列：content_hash（新库建表时已含）
+	var hasHashCol int
+	if err := d.conn.QueryRow(
+		`SELECT COUNT(*) FROM pragma_table_info('files') WHERE name = 'content_hash'`,
+	).Scan(&hasHashCol); err == nil && hasHashCol == 0 {
+		if _, err := d.conn.Exec(`ALTER TABLE files ADD COLUMN content_hash TEXT`); err != nil {
+			return fmt.Errorf("alter files add content_hash: %w", err)
+		}
+	}
+	// 历史行 content_hash 为 NULL（ALTER 补列所致），统一归一为空串，
+	// 避免 Scan(NULL → string) 报错导致文件列表 500；读路径另有 IFNULL 兜底
+	if _, err := d.conn.Exec(`UPDATE files SET content_hash = '' WHERE content_hash IS NULL`); err != nil {
+		return fmt.Errorf("backfill files content_hash: %w", err)
+	}
+	if _, err := d.conn.Exec(
+		`CREATE INDEX IF NOT EXISTS idx_files_content_hash ON files(content_hash)`,
+	); err != nil {
+		return fmt.Errorf("create content_hash index: %w", err)
 	}
 
 	return nil
@@ -159,6 +188,10 @@ func (d *Database) GetAuthState() (*models.AuthState, error) {
 }
 
 func (d *Database) SetupAuth(passwordHash, salt string) error {
+	encHash, err := hashAuthHash(passwordHash)
+	if err != nil {
+		return err
+	}
 	tx, err := d.conn.Begin()
 	if err != nil {
 		return err
@@ -171,7 +204,7 @@ func (d *Database) SetupAuth(passwordHash, salt string) error {
 	}
 	_, err = tx.Exec(
 		"INSERT INTO auth (password_hash, salt) VALUES (?, ?)",
-		passwordHash, salt,
+		encHash, salt,
 	)
 	if err != nil {
 		return err
@@ -195,9 +228,13 @@ func (d *Database) UpdateEncryptedAccountKey(encKey []byte) error {
 }
 
 func (d *Database) UpdatePassword(passwordHash string, encKey []byte) error {
+	encHash, err := hashAuthHash(passwordHash)
+	if err != nil {
+		return err
+	}
 	result, err := d.conn.Exec(
 		"UPDATE auth SET password_hash = ?, encrypted_account_key = ? WHERE id = (SELECT MAX(id) FROM auth)",
-		passwordHash, encKey,
+		encHash, encKey,
 	)
 	if err != nil {
 		return err
@@ -238,14 +275,32 @@ func (d *Database) GetAuthSalt() (string, error) {
 }
 
 func (d *Database) VerifyPassword(authHash string) (bool, error) {
-	var count int
+	var stored string
 	err := d.conn.QueryRow(
-		"SELECT COUNT(*) FROM auth WHERE password_hash = ?", authHash,
-	).Scan(&count)
+		"SELECT password_hash FROM auth ORDER BY id DESC LIMIT 1",
+	).Scan(&stored)
 	if err != nil {
+		if err == sql.ErrNoRows {
+			return false, nil
+		}
 		return false, err
 	}
-	return count > 0, nil
+
+	match, err := verifyAuthHash(stored, authHash)
+	if err != nil || !match {
+		return match, err
+	}
+
+	// 历史明文凭据校验成功后自动升级为 argon2id 包裹存储
+	if !strings.HasPrefix(stored, "$argon2id$") {
+		if enc, herr := hashAuthHash(authHash); herr == nil {
+			_, _ = d.conn.Exec(
+				"UPDATE auth SET password_hash = ? WHERE id = (SELECT MAX(id) FROM auth)",
+				enc,
+			)
+		}
+	}
+	return true, nil
 }
 
 func (d *Database) IsSetupComplete() (bool, error) {
@@ -265,6 +320,13 @@ func (d *Database) RecordLoginAttempt(ip string, success bool) error {
 	return err
 }
 
+// ClearFailedLoginAttempts 登录成功后清零失败累计（全局锁定的设计约定：
+// 锁定是全局的，因此成功登录必须重置计数，避免历史失败拖累后续登录）。
+func (d *Database) ClearFailedLoginAttempts() error {
+	_, err := d.conn.Exec("DELETE FROM login_attempts WHERE success = 0")
+	return err
+}
+
 func (d *Database) GetFailedLoginCount(since time.Duration) (int, error) {
 	var count int
 	err := d.conn.QueryRow(
@@ -277,14 +339,45 @@ func (d *Database) GetFailedLoginCount(since time.Duration) (int, error) {
 	return count, nil
 }
 
+// GetLoginHistory 按时间倒序返回最近 limit 条登录尝试（成功登录后失败记录
+// 会被清零，因此表中通常是「全部成功记录 + 距上次成功以来的失败」）。
+func (d *Database) GetLoginHistory(limit int) ([]models.LoginAttempt, error) {
+	rows, err := d.conn.Query(
+		"SELECT id, ip_address, success, created_at FROM login_attempts ORDER BY id DESC LIMIT ?",
+		limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]models.LoginAttempt, 0)
+	for rows.Next() {
+		var a models.LoginAttempt
+		var success int
+		var created string
+		if err := rows.Scan(&a.ID, &a.IPAddress, &success, &created); err != nil {
+			return nil, err
+		}
+		a.Success = success != 0
+		if t, err := time.Parse("2006-01-02 15:04:05", created); err == nil {
+			a.CreatedAt = t
+		} else if t, err := time.Parse(time.RFC3339, created); err == nil {
+			a.CreatedAt = t
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
 func (d *Database) CreateFile(file *models.FileRecord) error {
 	_, err := d.conn.Exec(
 		`INSERT INTO files (id, name_encrypted, parent_id, is_directory, file_size, file_type,
-		 oss_key, encrypted_file_key, iv, salt, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 oss_key, encrypted_file_key, iv, salt, content_hash, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		file.ID, file.NameEncrypted, file.ParentID, file.IsDirectory,
 		file.FileSize, file.FileType, file.OSSKey, file.EncryptedFileKey,
-		file.IV, file.Salt, file.CreatedAt, file.UpdatedAt,
+		file.IV, file.Salt, file.ContentHash, file.CreatedAt, file.UpdatedAt,
 	)
 	return err
 }
@@ -295,11 +388,11 @@ func (d *Database) GetFiles(parentID *string) ([]models.FileRecord, error) {
 
 	if parentID == nil {
 		rows, err = d.conn.Query(
-			"SELECT id, name_encrypted, parent_id, is_directory, file_size, file_type, oss_key, encrypted_file_key, iv, salt, created_at, updated_at, deleted_at FROM files WHERE parent_id IS NULL AND deleted_at IS NULL ORDER BY is_directory DESC, name_encrypted ASC",
+			"SELECT id, name_encrypted, parent_id, is_directory, file_size, file_type, oss_key, encrypted_file_key, iv, salt, IFNULL(content_hash, '') AS content_hash, created_at, updated_at, deleted_at FROM files WHERE parent_id IS NULL AND deleted_at IS NULL ORDER BY is_directory DESC, name_encrypted ASC",
 		)
 	} else {
 		rows, err = d.conn.Query(
-			"SELECT id, name_encrypted, parent_id, is_directory, file_size, file_type, oss_key, encrypted_file_key, iv, salt, created_at, updated_at, deleted_at FROM files WHERE parent_id = ? AND deleted_at IS NULL ORDER BY is_directory DESC, name_encrypted ASC",
+			"SELECT id, name_encrypted, parent_id, is_directory, file_size, file_type, oss_key, encrypted_file_key, iv, salt, IFNULL(content_hash, '') AS content_hash, created_at, updated_at, deleted_at FROM files WHERE parent_id = ? AND deleted_at IS NULL ORDER BY is_directory DESC, name_encrypted ASC",
 			*parentID,
 		)
 	}
@@ -314,7 +407,7 @@ func (d *Database) GetFiles(parentID *string) ([]models.FileRecord, error) {
 		if err := rows.Scan(
 			&f.ID, &f.NameEncrypted, &f.ParentID, &f.IsDirectory,
 			&f.FileSize, &f.FileType, &f.OSSKey, &f.EncryptedFileKey,
-			&f.IV, &f.Salt, &f.CreatedAt, &f.UpdatedAt, &f.DeletedAt,
+			&f.IV, &f.Salt, &f.ContentHash, &f.CreatedAt, &f.UpdatedAt, &f.DeletedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -324,15 +417,80 @@ func (d *Database) GetFiles(parentID *string) ([]models.FileRecord, error) {
 	return files, nil
 }
 
+// FileStatRow 统计聚合用的精简文件行（不含密钥字段）
+type FileStatRow struct {
+	ID            string
+	ParentID      *string
+	IsDirectory   bool
+	FileSize      int64
+	FileType      string
+	NameEncrypted string
+}
+
+// GetFileStatRows 返回全部未删除文件/目录的精简行，供全库统计聚合
+func (d *Database) GetFileStatRows() ([]FileStatRow, error) {
+	rows, err := d.conn.Query(
+		`SELECT id, parent_id, is_directory, file_size, IFNULL(file_type, ''), name_encrypted
+		 FROM files WHERE deleted_at IS NULL`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]FileStatRow, 0)
+	for rows.Next() {
+		var r FileStatRow
+		if err := rows.Scan(&r.ID, &r.ParentID, &r.IsDirectory, &r.FileSize, &r.FileType, &r.NameEncrypted); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// LoginDayCount 某日成功登录次数
+type LoginDayCount struct {
+	Day   string `json:"day"`
+	Count int    `json:"count"`
+}
+
+// GetLoginSuccessDaily 返回最近 days 天每天的成功登录次数（按日期分组）。
+// created_at 兼容 'YYYY-MM-DD HH:MM:SS' 与 RFC3339 两种格式，
+// 两者前 10 位均为日期，substr + 字符串比较均成立。
+func (d *Database) GetLoginSuccessDaily(days int) ([]LoginDayCount, error) {
+	rows, err := d.conn.Query(
+		`SELECT substr(created_at, 1, 10) AS day, COUNT(*)
+		 FROM login_attempts
+		 WHERE success = 1 AND created_at >= date('now', ?)
+		 GROUP BY day ORDER BY day ASC`,
+		fmt.Sprintf("-%d days", days-1),
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]LoginDayCount, 0)
+	for rows.Next() {
+		var lc LoginDayCount
+		if err := rows.Scan(&lc.Day, &lc.Count); err != nil {
+			return nil, err
+		}
+		out = append(out, lc)
+	}
+	return out, rows.Err()
+}
+
 func (d *Database) GetFile(id string) (*models.FileRecord, error) {
 	var f models.FileRecord
 	err := d.conn.QueryRow(
-		"SELECT id, name_encrypted, parent_id, is_directory, file_size, file_type, oss_key, encrypted_file_key, iv, salt, created_at, updated_at, deleted_at FROM files WHERE id = ? AND deleted_at IS NULL",
+		"SELECT id, name_encrypted, parent_id, is_directory, file_size, file_type, oss_key, encrypted_file_key, iv, salt, IFNULL(content_hash, '') AS content_hash, created_at, updated_at, deleted_at FROM files WHERE id = ? AND deleted_at IS NULL",
 		id,
 	).Scan(
 		&f.ID, &f.NameEncrypted, &f.ParentID, &f.IsDirectory,
 		&f.FileSize, &f.FileType, &f.OSSKey, &f.EncryptedFileKey,
-		&f.IV, &f.Salt, &f.CreatedAt, &f.UpdatedAt, &f.DeletedAt,
+		&f.IV, &f.Salt, &f.ContentHash, &f.CreatedAt, &f.UpdatedAt, &f.DeletedAt,
 	)
 	if err != nil {
 		return nil, err
@@ -437,11 +595,21 @@ func (d *Database) UpdateFile(id string, nameEncrypted string) error {
 	)
 	return err
 }
-func (d *Database) UpdateFileContent(id string, fileSize int64, fileType string, encKey, iv, salt []byte, ossKey string) error {
+
+func (d *Database) UpdateFileParent(id string, parentID *string) error {
 	now := time.Now()
+	_, err := d.conn.Exec(
+		"UPDATE files SET parent_id = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL",
+		parentID, now, id,
+	)
+	return err
+}
+func (d *Database) UpdateFileContent(id string, fileSize int64, fileType string, encKey, iv, salt []byte, ossKey string, contentHash string) error {
+	now := time.Now()
+	// content_hash 恒为字符串（清空传 ''，不再写 NULL——NULL 会破坏 Scan）
 	result, err := d.conn.Exec(
-		"UPDATE files SET file_size = ?, file_type = ?, encrypted_file_key = ?, iv = ?, salt = ?, oss_key = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL",
-		fileSize, fileType, encKey, iv, salt, ossKey, now, id,
+		"UPDATE files SET file_size = ?, file_type = ?, encrypted_file_key = ?, iv = ?, salt = ?, oss_key = ?, content_hash = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL",
+		fileSize, fileType, encKey, iv, salt, ossKey, contentHash, now, id,
 	)
 	if err != nil {
 		return err
@@ -453,15 +621,36 @@ func (d *Database) UpdateFileContent(id string, fileSize int64, fileType string,
 	return nil
 }
 
+// FindFileByContentHash 内容寻址查重：返回任意内容哈希相同的有效文件
+// （仅文件、已排除软删除与无对象记录），供上传去重复用同一 OSS 对象。
+func (d *Database) FindFileByContentHash(contentHash string) (*models.FileRecord, error) {
+	if contentHash == "" {
+		return nil, sql.ErrNoRows
+	}
+	var f models.FileRecord
+	err := d.conn.QueryRow(
+		"SELECT id, name_encrypted, parent_id, is_directory, file_size, file_type, oss_key, encrypted_file_key, iv, salt, IFNULL(content_hash, '') AS content_hash, created_at, updated_at, deleted_at FROM files WHERE content_hash = ? AND deleted_at IS NULL AND is_directory = 0 AND oss_key != '' LIMIT 1",
+		contentHash,
+	).Scan(
+		&f.ID, &f.NameEncrypted, &f.ParentID, &f.IsDirectory,
+		&f.FileSize, &f.FileType, &f.OSSKey, &f.EncryptedFileKey,
+		&f.IV, &f.Salt, &f.ContentHash, &f.CreatedAt, &f.UpdatedAt, &f.DeletedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &f, nil
+}
+
 func (d *Database) GetFileByOSSKey(ossKey string) (*models.FileRecord, error) {
 	var f models.FileRecord
 	err := d.conn.QueryRow(
-		"SELECT id, name_encrypted, parent_id, is_directory, file_size, file_type, oss_key, encrypted_file_key, iv, salt, created_at, updated_at, deleted_at FROM files WHERE oss_key = ? AND deleted_at IS NULL",
+		"SELECT id, name_encrypted, parent_id, is_directory, file_size, file_type, oss_key, encrypted_file_key, iv, salt, IFNULL(content_hash, '') AS content_hash, created_at, updated_at, deleted_at FROM files WHERE oss_key = ? AND deleted_at IS NULL",
 		ossKey,
 	).Scan(
 		&f.ID, &f.NameEncrypted, &f.ParentID, &f.IsDirectory,
 		&f.FileSize, &f.FileType, &f.OSSKey, &f.EncryptedFileKey,
-		&f.IV, &f.Salt, &f.CreatedAt, &f.UpdatedAt, &f.DeletedAt,
+		&f.IV, &f.Salt, &f.ContentHash, &f.CreatedAt, &f.UpdatedAt, &f.DeletedAt,
 	)
 	if err != nil {
 		return nil, err
@@ -503,8 +692,52 @@ func (d *Database) EnableMFA() error {
 }
 
 func (d *Database) DisableMFA() error {
-	_, err := d.conn.Exec("DELETE FROM mfa")
+	if _, err := d.conn.Exec("DELETE FROM mfa"); err != nil {
+		return err
+	}
+	// 恢复码随 MFA 一起失效
+	_, err := d.conn.Exec("DELETE FROM mfa_recovery_codes")
 	return err
+}
+
+// ReplaceRecoveryCodes 原子替换全部恢复码哈希（重新生成即令旧码全部失效）
+func (d *Database) ReplaceRecoveryCodes(hashes []string) error {
+	tx, err := d.conn.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec("DELETE FROM mfa_recovery_codes"); err != nil {
+		return err
+	}
+	for _, h := range hashes {
+		if _, err := tx.Exec("INSERT INTO mfa_recovery_codes (code_hash) VALUES (?)", h); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// ConsumeRecoveryCode 一次性消费：命中未使用的码即标记已用（原子），返回是否命中。
+// 已使用过的码再次提交返回 false，防止重放。
+func (d *Database) ConsumeRecoveryCode(hash string) (bool, error) {
+	res, err := d.conn.Exec(
+		"UPDATE mfa_recovery_codes SET used_at = datetime('now') WHERE code_hash = ? AND used_at IS NULL",
+		hash,
+	)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n == 1, nil
+}
+
+// CountRecoveryCodes 恢复码统计（总数 / 剩余未使用）
+func (d *Database) CountRecoveryCodes() (total int, remaining int, err error) {
+	err = d.conn.QueryRow(
+		"SELECT COUNT(*), IFNULL(SUM(CASE WHEN used_at IS NULL THEN 1 ELSE 0 END), 0) FROM mfa_recovery_codes",
+	).Scan(&total, &remaining)
+	return
 }
 
 func (d *Database) RecordTOTPAttempt(success bool) error {

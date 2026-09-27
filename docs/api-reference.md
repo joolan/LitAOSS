@@ -148,6 +148,35 @@ Session Token 在登录成功后返回，有效期 24 小时。
 - `400` — 验证码错误
 - `429` — 验证尝试次数过多，已被锁定
 
+### POST /api/auth/verify-recovery
+
+用**恢复码**完成 MFA 验证（认证器丢失时的登录途径）。与 `verify-totp` 共用
+pending 会话流转与失败锁定；恢复码**一次性消费**，用过即失效。
+
+**请求:**
+```json
+{
+  "code": "ABCD-EFGH-JKLM-NPQR-STUV"
+}
+```
+
+（大小写、横线、空格不敏感，服务端规范化后比对）
+
+**响应:**
+```json
+{
+  "ok": true
+}
+```
+
+**错误:**
+- `400` — 恢复码无效或已使用过
+- `429` — 尝试次数过多，已被锁定（与 TOTP 共用计数）
+
+**安全说明:** 恢复码为 96 bit 密码学随机值，服务端仅存 SHA-256 哈希；
+离线暴力枚举不可行，不破坏零知识口径。重新生成使旧码全部失效；
+禁用 MFA 时恢复码随之清空。
+
 ### POST /api/auth/logout
 
 登出并销毁当前会话。
@@ -164,6 +193,40 @@ Session Token 在登录成功后返回，有效期 24 小时。
 ## 3. 受保护接口 (需鉴权 + MFA)
 
 以下接口需要在请求头中携带 `X-Session-Token`，如已启用 MFA 则需完成 TOTP 验证。
+
+### GET /api/auth/login-history
+
+获取最近 50 条登录尝试（倒序，含成功与失败）。成功登录后失败记录会被清零，因此历史通常是「全部成功 + 距上次成功以来的失败」。IP 取自可信代理提交的 `X-Forwarded-For`（见 `server.trusted_proxies`）。
+
+**响应:**
+```json
+{
+  "attempts": [
+    { "id": 7, "ip_address": "127.0.0.1", "success": true, "created_at": "2026-09-27T01:24:07Z" },
+    { "id": 6, "ip_address": "127.0.0.1", "success": false, "created_at": "2026-09-27T01:20:11Z" }
+  ]
+}
+```
+
+---
+
+### GET /api/auth/login-stats
+
+近 N 天（`days` 可选，默认 30，1–90）每日**成功**登录次数，供统计页图表使用。按日期升序返回，无登录的日期不出现（前端补零）。
+
+**查询参数:** `days` — 统计天数（默认 30）
+
+**响应:**
+```json
+{
+  "days": [
+    { "day": "2026-09-25", "count": 2 },
+    { "day": "2026-09-27", "count": 1 }
+  ]
+}
+```
+
+---
 
 ### POST /api/auth/verify-totp-delete
 
@@ -274,11 +337,53 @@ Session Token 在登录成功后返回，有效期 24 小时。
   "encrypted_file_key": "加密的 File Key (Base64)",
   "iv": [1, 2, 3, ...],
   "salt": [],
-  "oss_key": "files/uuid/random.enc"
+  "oss_key": "files/uuid/random.enc",
+  "content_hash": "客户端内容哈希 (可选，用于去重)"
 }
 ```
 
 **响应:** 创建的文件对象。
+
+### POST /api/files/dedup-check
+
+内容寻址查重：客户端在上传前提交内容哈希，命中则可跳过加密与 OSS 上传、
+直接复用既有文件的密钥封装字段建记录（同内容同一密文对象）。
+
+内容哈希为客户端用 **Account Key** 派生的 HMAC-SHA256（见 `contentHash.ts`），
+服务端只做相等比对，无密钥无法离线猜解，不破坏零知识模型。
+修改主密码只重新包装 Account Key、原始字节不变，改密前后哈希稳定，查重持续有效。
+
+**请求:**
+```json
+{
+  "content_hash": "64 位十六进制哈希"
+}
+```
+
+**响应:**
+```json
+{ "found": false }
+```
+
+或命中：
+
+```json
+{
+  "found": true,
+  "file": {
+    "oss_key": "files/uuid/random.enc",
+    "encrypted_file_key": "复用的 File Key 封装",
+    "iv": "...",
+    "salt": "...",
+    "file_size": 1024,
+    "file_type": "text/plain"
+  }
+}
+```
+
+**说明:**
+- 仅匹配有效（未软删除）的文件记录；历史文件无 `content_hash`（NULL）不参与匹配
+- 恢复历史版本会清空 `content_hash`（内容未知，宁可失去去重也不误配）
 
 ### PUT /api/files/:id/rename
 
@@ -299,6 +404,28 @@ Session Token 在登录成功后返回，有效期 24 小时。
 }
 ```
 
+### PUT /api/files/:id/move
+
+移动文件或文件夹到指定目录（`parent_id` 传 `null`/省略表示移到根目录）。
+
+**请求:**
+```json
+{
+  "parent_id": "目标文件夹 ID 或 null"
+}
+```
+
+**校验规则:**
+- 目标必须存在且为文件夹，否则 `400`
+- 不能移动到自身；文件夹不能移动到自身的子文件夹（防环），否则 `400`
+
+**响应:**
+```json
+{
+  "ok": true
+}
+```
+
 ### PUT /api/files/:id/content
 
 更新文件内容元数据 (文本编辑保存时调用；旧内容已先存入版本历史)。
@@ -311,7 +438,8 @@ Session Token 在登录成功后返回，有效期 24 小时。
   "encrypted_file_key": "新内容的 File Key (Base64 或字节数组)",
   "iv": [1, 2, 3, ...],
   "salt": [],
-  "oss_key": "files/uuid/random.enc"
+  "oss_key": "files/uuid/random.enc",
+  "content_hash": "新内容的客户端哈希；空字符串表示清除（内容未知时）"
 }
 ```
 
@@ -557,7 +685,14 @@ Session Token 在登录成功后返回，有效期 24 小时。
 
 ### POST /api/mfa/setup
 
-初始化 MFA (返回 TOTP 密钥和 URI)。
+初始化 MFA (返回 TOTP 密钥和 URI)。**必须携带主密码派生的 `password_hash`**：仅凭会话（如会话被盗）不允许重置 TOTP 密钥，防止偷换认证器后锁定号主，与 `mfa/disable` 同一验证与锁定策略。
+
+**请求:**
+```json
+{
+  "password_hash": "当前密码的 Auth Hash"
+}
+```
 
 **响应:**
 ```json
@@ -567,6 +702,11 @@ Session Token 在登录成功后返回，有效期 24 小时。
   "uri": "otpauth://totp/..."
 }
 ```
+
+**错误:**
+- `400` — `password_hash` 缺失或密码错误
+- `409` — MFA 已启用（需先禁用）
+- `429` — 验证失败次数过多，已被锁定（5 次 / 15 分钟，与改密码/禁用 MFA 共用计数）
 
 ### POST /api/mfa/enable
 
@@ -605,15 +745,44 @@ Session Token 在登录成功后返回，有效期 24 小时。
 }
 ```
 
-### GET /api/mfa/status
+### POST /api/mfa/recovery-codes
 
-获取 MFA 状态。
+生成（或整体重新生成）10 个一次性登录恢复码，**明文仅本次响应返回**，
+请立即离线保存。重新生成会使旧码全部失效。需 MFA 已启用，且**必须携带主密码派生的
+`password_hash`**：恢复码是长期 MFA 凭证，仅凭会话不得铸造/轮换（防会话被盗后预置
+自己的码或静默作废号主的找回码），与 `mfa/setup`、`mfa/disable` 同一验证与锁定策略。
+
+**请求:**
+```json
+{
+  "password_hash": "当前密码的 Auth Hash"
+}
+```
 
 **响应:**
 ```json
 {
   "ok": true,
-  "enabled": true
+  "codes": ["ABCD-EFGH-JKLM-NPQR-STUV", "..."],
+  "total": 10
+}
+```
+
+**错误:**
+- `400` — MFA 未启用 / `password_hash` 缺失或密码错误
+- `429` — 验证失败次数过多，已被锁定（5 次 / 15 分钟，与改密码/禁用 MFA 共用计数）
+
+### GET /api/mfa/status
+
+获取 MFA 状态及恢复码统计。
+
+**响应:**
+```json
+{
+  "ok": true,
+  "enabled": true,
+  "recovery_total": 10,
+  "recovery_remaining": 7
 }
 ```
 
@@ -623,7 +792,7 @@ Session Token 在登录成功后返回，有效期 24 小时。
 
 ### GET /api/stats
 
-获取存储统计信息。
+获取存储统计信息（**仅根目录直下条目**；全库统计见 `/stats/summary`）。
 
 **响应:**
 ```json
@@ -633,6 +802,33 @@ Session Token 在登录成功后返回，有效期 24 小时。
   "folder_count": 5
 }
 ```
+
+---
+
+### GET /api/stats/summary
+
+全库统计（统计页图表数据源）：总量、文件类型分布、顶层目录占用 Top 10。
+目录名返回**加密形态**，由客户端解密后展示（零知识不变）。
+
+**响应:**
+```json
+{
+  "totals": { "total_size": 1048576, "file_count": 42, "folder_count": 5 },
+  "types": [
+    { "file_type": "image/png", "count": 12, "size": 524288 },
+    { "file_type": "unknown", "count": 1, "size": 1024 }
+  ],
+  "top_dirs": [
+    { "id": "目录 ID", "name_encrypted": "加密目录名", "count": 30, "size": 900000 },
+    { "id": "", "name_encrypted": "", "count": 4, "size": 100000 }
+  ]
+}
+```
+
+**说明:**
+- 仅统计未软删除记录；目录占用为该**顶层目录**下全部文件递归求和
+- `id` 为空字符串表示根目录散文件（`name_encrypted` 同样为空，客户端自行命名）
+- `file_type` 为空归一为 `"unknown"`
 
 ---
 
@@ -802,6 +998,48 @@ Session Token 在登录成功后返回，有效期 24 小时。
 ```
 
 > **注意**: 恢复内容重启后生效（同本地恢复的暂存机制）。
+
+### POST /api/backup/drill
+
+**恢复演练**：验证指定备份（缺省 = 本地最新一份）能被真实恢复流程打开、迁移并读取。把备份字节级复制到临时目录后，走与恢复后启动完全相同的 `db.New → 建表/迁移 → 全量查询` 路径做只读体检——**不写 `.restore`、不触碰线上数据、不需要 MFA 二次验证，可反复执行**。
+
+**请求**（body 可省略或为空 = 最新备份）:
+```json
+{
+  "name": "lit-aoss_20260927_030000.db"
+}
+```
+
+**响应**（体检失败也返回 `200`，由 `ok`/`checks` 表达结果）:
+```json
+{
+  "ok": true,
+  "report": {
+    "ok": true,
+    "name": "lit-aoss_20260927_030000.db",
+    "size": 49152,
+    "created_at": "2026-09-27T03:00:01Z",
+    "checks": [
+      { "name": "备份文件", "ok": true, "detail": "…（49152 字节）" },
+      { "name": "字节级拷贝", "ok": true, "detail": "已复制到临时目录（不写 .restore，不碰线上数据）" },
+      { "name": "打开与迁移", "ok": true, "detail": "建表与迁移全部通过（含历史库补列回填）" },
+      { "name": "账号数据", "ok": true, "detail": "主密码哈希与加密密钥齐备" },
+      { "name": "文件全量扫描", "ok": true, "detail": "12 个文件 / 3 个目录" },
+      { "name": "根目录文件列表", "ok": true, "detail": "5 条根目录记录可正常读取" },
+      { "name": "MFA 状态表", "ok": true, "detail": "MFA 记录可读取" }
+    ],
+    "file_count": 12,
+    "folder_count": 3,
+    "duration_ms": 24
+  }
+}
+```
+
+**错误:**
+- `400` — `name` 含路径分隔符或 `..`
+- `404` — `backup not found` / `no backups found`
+
+**用途**: 定期演练可提前发现「备份存在但恢复后读不了」类问题（例如 `content_hash` 为 NULL 曾导致 `GET /api/files` 500——该类历史库迁移错误会在「打开与迁移」「根目录文件列表」检查项上直接失败）。
 
 ---
 

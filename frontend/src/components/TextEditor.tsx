@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { X, Save, AlertCircle, Check, History, RotateCcw } from 'lucide-react';
 import { FileRecord, FileVersion, fromBase64Bytes } from '../api/client';
 import { unwrapFileKeyFromStorage, wrapFileKeyForStorage } from '../crypto/fileKey';
+import { contentHash } from '../contentHash';
 import { getPreviewMode } from '../crypto/crypto';
 
 interface TextEditorProps {
@@ -69,6 +70,7 @@ export default function TextEditor({ file, fileName, onClose }: TextEditorProps)
 
     try {
       const plaintext = new TextEncoder().encode(content);
+      const content_hash = await contentHash(plaintext).catch(() => '');
 
       const fileKey = await crypto.subtle.generateKey(
         { name: 'AES-GCM', length: 256 },
@@ -126,6 +128,7 @@ export default function TextEditor({ file, fileName, onClose }: TextEditorProps)
         iv: Array.from(iv),
         salt: [],
         oss_key: ossKey,
+        content_hash,
       });
 
       setOriginalContent(content);

@@ -28,6 +28,7 @@ type FileRecord struct {
 	EncryptedFileKey []byte   `json:"encrypted_file_key"`
 	IV              []byte     `json:"iv"`
 	Salt            []byte     `json:"salt"`
+	ContentHash     string     `json:"content_hash"`
 	CreatedAt       time.Time  `json:"created_at"`
 	UpdatedAt       time.Time  `json:"updated_at"`
 	DeletedAt       *time.Time `json:"deleted_at"`
@@ -79,6 +80,7 @@ type FileUploadRequest struct {
 	IV               []byte `json:"iv" binding:"required"`
 	Salt             []byte `json:"salt" binding:"required"`
 	OSSKey           string `json:"oss_key" binding:"required"`
+	ContentHash      string `json:"content_hash"`
 }
 
 type PresignRequest struct {
@@ -114,8 +116,10 @@ type MFASetupResponse struct {
 }
 
 type MFAStatusResponse struct {
-	OK      bool `json:"ok"`
-	Enabled bool `json:"enabled"`
+	OK               bool `json:"ok"`
+	Enabled          bool `json:"enabled"`
+	RecoveryTotal    int  `json:"recovery_total"`
+	RecoveryRemaining int `json:"recovery_remaining"`
 }
 
 type TOTPVerifyRequest struct {

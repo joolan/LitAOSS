@@ -2,7 +2,8 @@
   "server": {
     "port": "8780",
     "host": "0.0.0.0",
-    "allowed_origin": "http://localhost:3000"
+    "allowed_origin": "http://localhost:3000",
+    "trusted_proxies": ["127.0.0.1/32", "::1/128"]
   },
   "database": {
     "path": "./data/lit-aoss.db"

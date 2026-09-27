@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { Database, Clock, RefreshCw, AlertCircle, Check, Download, Trash2, Shield, Cloud } from 'lucide-react';
-import { api, BackupConfig, BackupEntry, OSSBackupEntry, OSSBackupSummary } from '../api/client';
+import { api, BackupConfig, BackupEntry, OSSBackupEntry, OSSBackupSummary, DrillReport } from '../api/client';
 
 interface BackupSettingsProps {
   onError: (msg: string) => void;
@@ -38,6 +38,8 @@ export default function BackupSettings({ onError, onSuccess }: BackupSettingsPro
   const [mfaCode, setMfaCode] = useState('');
   const [mfaError, setMfaError] = useState('');
   const [mfaBusy, setMfaBusy] = useState(false);
+  const [drilling, setDrilling] = useState<string | null>(null);
+  const [drillResult, setDrillResult] = useState<DrillReport | null>(null);
 
   useEffect(() => {
     loadConfig();
@@ -152,6 +154,29 @@ export default function BackupSettings({ onError, onSuccess }: BackupSettingsPro
       }
     } finally {
       setRestoringOss(null);
+    }
+  };
+
+  const doDrill = async (name?: string) => {
+    setDrilling(name ?? 'latest');
+    setDrillResult(null);
+    onError('');
+    try {
+      const res = await api.backupDrill(name);
+      if (res.report) {
+        setDrillResult(res.report);
+        if (res.ok) {
+          onSuccess(`恢复演练通过：${res.report.name}`);
+        } else {
+          onError(`恢复演练失败：${res.report.error || '未知错误'}`);
+        }
+      } else if (!res.ok) {
+        onError(res.error || '恢复演练失败');
+      }
+    } catch (err: any) {
+      onError(err.message || '恢复演练失败');
+    } finally {
+      setDrilling(null);
     }
   };
 
@@ -309,7 +334,16 @@ export default function BackupSettings({ onError, onSuccess }: BackupSettingsPro
 
           {/* 备份列表 */}
           <div>
-            <h4 className="text-sm font-medium text-gray-300 mb-2">历史备份 ({backups.length})</h4>
+            <div className="flex items-center justify-between mb-2">
+              <h4 className="text-sm font-medium text-gray-300">历史备份 ({backups.length})</h4>
+              <button
+                onClick={() => doDrill()}
+                disabled={drilling !== null}
+                className="px-2 py-1 bg-blue-600/20 hover:bg-blue-600/40 text-blue-300 text-xs rounded transition-colors disabled:opacity-50"
+              >
+                {drilling === 'latest' ? '演练中...' : '恢复演练（最新）'}
+              </button>
+            </div>
             {backups.length === 0 ? (
               <p className="text-xs text-gray-500">暂无备份</p>
             ) : (
@@ -323,6 +357,13 @@ export default function BackupSettings({ onError, onSuccess }: BackupSettingsPro
                       </p>
                     </div>
                     <button
+                      onClick={() => doDrill(b.name)}
+                      disabled={drilling !== null}
+                      className="ml-2 px-2 py-1 bg-gray-600/20 hover:bg-gray-600/40 text-gray-300 text-xs rounded transition-colors disabled:opacity-50"
+                    >
+                      {drilling === b.name ? '演练中...' : '演练'}
+                    </button>
+                    <button
                       onClick={() => doRestore(b.name)}
                       disabled={restoring === b.name}
                       className="ml-2 px-2 py-1 bg-amber-600/20 hover:bg-amber-600/40 text-amber-400 text-xs rounded transition-colors disabled:opacity-50"
@@ -331,6 +372,52 @@ export default function BackupSettings({ onError, onSuccess }: BackupSettingsPro
                     </button>
                   </div>
                 ))}
+              </div>
+            )}
+            {/* 恢复演练报告 */}
+            {drillResult && (
+              <div
+                className={`mt-3 p-3 rounded-lg border ${
+                  drillResult.ok
+                    ? 'bg-emerald-500/5 border-emerald-500/30'
+                    : 'bg-red-500/5 border-red-500/30'
+                }`}
+              >
+                <div className="flex items-center justify-between mb-2">
+                  <span
+                    className={`text-sm font-medium flex items-center gap-1.5 ${
+                      drillResult.ok ? 'text-emerald-400' : 'text-red-400'
+                    }`}
+                  >
+                    <Check className="w-3.5 h-3.5" />
+                    {drillResult.ok ? '恢复演练通过' : '恢复演练失败'}
+                  </span>
+                  <div className="flex items-center gap-2 text-xs text-gray-500">
+                    <span>
+                      {drillResult.name} · {drillResult.duration_ms} ms
+                      {drillResult.ok &&
+                        ` · ${drillResult.file_count} 个文件 / ${drillResult.folder_count} 个目录`}
+                    </span>
+                    <button
+                      onClick={() => setDrillResult(null)}
+                      className="text-gray-500 hover:text-gray-300"
+                      aria-label="关闭演练报告"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                </div>
+                <div className="space-y-1">
+                  {drillResult.checks.map((ck) => (
+                    <div key={ck.name} className="flex items-start gap-2 text-xs">
+                      <span className={ck.ok ? 'text-emerald-400' : 'text-red-400'}>
+                        {ck.ok ? '✓' : '✗'}
+                      </span>
+                      <span className="text-gray-300 w-24 shrink-0">{ck.name}</span>
+                      <span className="text-gray-500 flex-1">{ck.detail}</span>
+                    </div>
+                  ))}
+                </div>
               </div>
             )}
           </div>

@@ -58,7 +58,7 @@ LitAOSS 采用零知识架构，核心原则：
 | 最小长度 | 12 字符 |
 | 最大长度 | 128 字符 |
 | 字符集 | 任意 Unicode 字符 |
-| 存储方式 | 仅存储 PBKDF2 派生的 Auth Hash |
+| 存储方式 | 服务端存 argon2id 包裹后的 Auth Hash（客户端提交的是 PBKDF2 派生值） |
 
 ### 2.2 密钥派生
 
@@ -78,9 +78,9 @@ LitAOSS 采用零知识架构，核心原则：
 | 层级 | 措施 |
 |------|------|
 | 计算成本 | PBKDF2 500k 迭代，每次尝试约 200-500ms |
-| 账户锁定 | 连续 5 次失败后锁定 15 分钟 |
+| 账户锁定 | 连续 5 次失败后锁定 15 分钟（**全局锁定**，登录成功即清零失败计数） |
 | 密码复杂度 | 最少 12 字符 |
-| 存储安全 | 服务端仅存 Auth Hash，不可逆 |
+| 存储安全 | 服务端存 argon2id(Auth Hash)，库被拖也无法直接重放登录；历史明文值在下次成功登录时自动升级 |
 
 ### 2.4 Setup 竞态防护
 
@@ -208,7 +208,7 @@ X-Content-Type-Options: nosniff
 X-Frame-Options: DENY
 X-XSS-Protection: 1; mode=block
 Referrer-Policy: strict-origin-when-cross-origin
-Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https://*.aliyuncs.com; font-src 'self' data:; connect-src 'self' https://*.aliyuncs.com; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'
+Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https://*.aliyuncs.com; font-src 'self' data:; connect-src 'self' https://*.aliyuncs.com; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'
 ```
 
 CSP 双重生效路径:
@@ -218,9 +218,22 @@ CSP 双重生效路径:
 
 说明:
 
-- `script-src 'unsafe-inline'` 为 Vite 开发环境内联 HMR preamble 所需；生产环境建议改为 nonce/hash 并去掉 `'unsafe-inline'`
+- `script-src` 已收紧为 `'self'`（无 `'unsafe-inline'`），禁止任何内联脚本执行；预览渲染自检（`previewTest.mjs`）与登录页浏览器冒烟均已验证无违规
 - `img-src` / `connect-src` 允许 `https://*.aliyuncs.com`（浏览器 ↔ OSS 预签名直传/下载）；若 OSS 使用自定义 CNAME 域名，需在两处策略中同步扩展
 - `frame-ancestors 'none'` 仅响应头生效（meta 标签中浏览器忽略），配合 `X-Frame-Options: DENY` 防点击劫持
+
+### 5.4 对象键命名空间
+
+- `POST /api/oss/key` 仅接受 `folder=files`，对象键格式固定为 `files/<uuid>/<hex>.enc`
+- `POST /api/presign/upload` 与 `/api/presign/download` 对 `oss_key` 做同一格式正则校验，不匹配直接 `400`
+- 后端备份对象（`db-backups/` 前缀）由服务端内部直接调用存储 SDK 生成 URL，不经预签名接口——持会话令牌无法读写文件命名空间以外的对象
+- OSS 备份恢复走 `POST /api/backup/restore-oss`，服务端校验 `db-backups/` 前缀后直出
+
+### 5.5 可信代理
+
+- `server.trusted_proxies`（IP/CIDR 列表，默认 `127.0.0.1/32`、`::1/128`）经 `router.SetTrustedProxies` 生效
+- 只有来自可信代理的 `X-Forwarded-For` 才会被 `ClientIP()` 采信：直连部署时伪造头被忽略，跨机反代需在配置中显式声明代理地址
+- 该 IP 用于登录尝试审计记录（`login_attempts`）
 
 ---
 

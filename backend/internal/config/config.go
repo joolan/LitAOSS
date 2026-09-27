@@ -27,6 +27,9 @@ type ServerConfig struct {
 	Port          string `json:"port"`
 	Host          string `json:"host"`
 	AllowedOrigin string `json:"allowed_origin,omitempty"`
+	// TrustedProxies 可信代理 IP/CIDR 列表：只有来自这些地址的 X-Forwarded-For
+	// 才会被采信（影响 ClientIP / 登录审计）。为空默认本机回环。
+	TrustedProxies []string `json:"trusted_proxies,omitempty"`
 }
 
 type DatabaseConfig struct {

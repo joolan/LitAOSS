@@ -1,17 +1,20 @@
-import { useState } from 'react';
-import { Settings as SettingsIcon, Key, Lock, Eye, EyeOff, Check, AlertCircle, Copy, Shield, RefreshCw, Wrench, Database } from 'lucide-react';
+import { useState, lazy, Suspense } from 'react';
+import { Settings as SettingsIcon, Key, Lock, Eye, EyeOff, Check, AlertCircle, Copy, Shield, RefreshCw, Wrench, Database, History, BarChart3 } from 'lucide-react';
 import { api, getServerVersion } from '../api/client';
 import ChangePassword from './ChangePassword';
 import MFASetup from './MFASetup';
 import FileEncryptTool from './FileEncryptTool';
 import BackupSettings from './BackupSettings';
+import LoginHistory from './LoginHistory';
 
 interface SettingsProps {
   onClose: () => void;
 }
 
-type Tab = 'encrypt-tool' | 'encrypt' | 'password' | 'mfa' | 'backup';
+type Tab = 'encrypt-tool' | 'encrypt' | 'password' | 'mfa' | 'backup' | 'history' | 'stats';
 type EncryptSubTab = 'encrypt' | 'decrypt';
+
+const StatsCharts = lazy(() => import('./StatsCharts'));
 
 export default function Settings({ onClose }: SettingsProps) {
   const [tab, setTab] = useState<Tab>('encrypt-tool');
@@ -89,10 +92,10 @@ export default function Settings({ onClose }: SettingsProps) {
           <button onClick={onClose} className="text-gray-400 hover:text-white text-lg">&times;</button>
         </div>
 
-        <div className="flex border-b border-gray-800">
+        <div className="flex border-b border-gray-800 overflow-x-auto">
           <button
             onClick={() => setTab('encrypt-tool')}
-            className={`flex-1 px-3 py-3 text-sm font-medium transition-colors ${
+            className={`flex-auto px-3 py-3 text-sm font-medium whitespace-nowrap transition-colors ${
               tab === 'encrypt-tool' ? 'text-emerald-400 border-b-2 border-emerald-400' : 'text-gray-400 hover:text-white'
             }`}
           >
@@ -101,7 +104,7 @@ export default function Settings({ onClose }: SettingsProps) {
           </button>
           <button
             onClick={() => setTab('encrypt')}
-            className={`flex-1 px-3 py-3 text-sm font-medium transition-colors ${
+            className={`flex-auto px-3 py-3 text-sm font-medium whitespace-nowrap transition-colors ${
               tab === 'encrypt' ? 'text-emerald-400 border-b-2 border-emerald-400' : 'text-gray-400 hover:text-white'
             }`}
           >
@@ -110,7 +113,7 @@ export default function Settings({ onClose }: SettingsProps) {
           </button>
           <button
             onClick={() => setTab('password')}
-            className={`flex-1 px-3 py-3 text-sm font-medium transition-colors ${
+            className={`flex-auto px-3 py-3 text-sm font-medium whitespace-nowrap transition-colors ${
               tab === 'password' ? 'text-emerald-400 border-b-2 border-emerald-400' : 'text-gray-400 hover:text-white'
             }`}
           >
@@ -119,7 +122,7 @@ export default function Settings({ onClose }: SettingsProps) {
           </button>
           <button
             onClick={() => setTab('mfa')}
-            className={`flex-1 px-3 py-3 text-sm font-medium transition-colors ${
+            className={`flex-auto px-3 py-3 text-sm font-medium whitespace-nowrap transition-colors ${
               tab === 'mfa' ? 'text-emerald-400 border-b-2 border-emerald-400' : 'text-gray-400 hover:text-white'
             }`}
           >
@@ -128,12 +131,30 @@ export default function Settings({ onClose }: SettingsProps) {
           </button>
           <button
             onClick={() => setTab('backup')}
-            className={`flex-1 px-3 py-3 text-sm font-medium transition-colors ${
+            className={`flex-auto px-3 py-3 text-sm font-medium whitespace-nowrap transition-colors ${
               tab === 'backup' ? 'text-emerald-400 border-b-2 border-emerald-400' : 'text-gray-400 hover:text-white'
             }`}
           >
             <Database className="w-4 h-4 inline mr-1" />
             备份
+          </button>
+          <button
+            onClick={() => setTab('history')}
+            className={`flex-auto px-3 py-3 text-sm font-medium whitespace-nowrap transition-colors ${
+              tab === 'history' ? 'text-emerald-400 border-b-2 border-emerald-400' : 'text-gray-400 hover:text-white'
+            }`}
+          >
+            <History className="w-4 h-4 inline mr-1" />
+            登录历史
+          </button>
+          <button
+            onClick={() => setTab('stats')}
+            className={`flex-auto px-3 py-3 text-sm font-medium whitespace-nowrap transition-colors ${
+              tab === 'stats' ? 'text-emerald-400 border-b-2 border-emerald-400' : 'text-gray-400 hover:text-white'
+            }`}
+          >
+            <BarChart3 className="w-4 h-4 inline mr-1" />
+            统计
           </button>
         </div>
 
@@ -300,6 +321,12 @@ export default function Settings({ onClose }: SettingsProps) {
 
           {tab === 'password' && <ChangePassword onClose={onClose} />}
           {tab === 'mfa' && <MFASetup onClose={onClose} />}
+          {tab === 'history' && <LoginHistory />}
+          {tab === 'stats' && (
+            <Suspense fallback={<div className="text-gray-400 text-sm py-8 text-center">加载统计…</div>}>
+              <StatsCharts />
+            </Suspense>
+          )}
           {tab === 'backup' && (
             <>
               {(error || success) && (

@@ -140,6 +140,7 @@ export default function VersionHistory({ file, fileName, onClose, onChanged }: V
         iv: (v.iv || '') as any,
         salt: (v.salt || '') as any,
         oss_key: v.oss_key,
+        content_hash: '',
       });
 
       setActionMsg(`已恢复到版本 ${v.version}`);

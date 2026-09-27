@@ -134,16 +134,36 @@ server {
     ssl_certificate /path/to/cert.pem;
     ssl_certificate_key /path/to/key.pem;
 
-    # 安全头
+    root /var/www/lit-aoss/frontend/dist;
+
+    # 安全头（注意：location 内出现任一 add_header 都会覆盖本层，因此下面各静态
+    # location 内重复了 nosniff）
     add_header X-Content-Type-Options nosniff;
     add_header X-Frame-Options DENY;
     add_header X-XSS-Protection "1; mode=block";
     add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
 
-    # 前端静态文件
+    # 前端静态文件（SPA fallback）
     location / {
-        root /var/www/lit-aoss/frontend/dist;
         try_files $uri $uri/ /index.html;
+    }
+
+    # PWA：service worker 与 manifest 必须每次回源，否则新版本 sw.js 不会生效
+    location = /sw.js {
+        add_header Cache-Control "no-cache";
+        add_header X-Content-Type-Options nosniff;
+    }
+
+    location = /manifest.webmanifest {
+        types { application/manifest+json webmanifest; }
+        add_header Cache-Control "no-cache";
+        add_header X-Content-Type-Options nosniff;
+    }
+
+    # 构建产物文件名带内容哈希，可长缓存
+    location ^~ /assets/ {
+        add_header Cache-Control "public, max-age=31536000, immutable";
+        add_header X-Content-Type-Options nosniff;
     }
 
     # API 代理
@@ -159,6 +179,8 @@ server {
     }
 }
 ```
+
+> **可信代理**: 如上例 nginx 与后端同机（`127.0.0.1`），默认 `server.trusted_proxies`（`127.0.0.1/32`、`::1/128`）即覆盖，`X-Forwarded-For` 中的客户端真实 IP 会被采信用于登录审计；若 nginx 部署在**其它机器**，必须把该代理 IP/CIDR 加入 `config.json` 的 `server.trusted_proxies`，否则后端只认 TCP 对端地址（即代理机 IP）。
 
 ### 3.5 systemd 服务 (Linux)
 

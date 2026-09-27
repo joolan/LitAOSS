@@ -472,3 +472,183 @@ func (h *Handler) RestoreBackupOSS(c *gin.Context) {
 	log.Printf("Database restored from OSS backup: %s", req.OSSKey)
 	c.JSON(http.StatusOK, gin.H{"ok": true, "message": "restore staged, restart server to apply"})
 }
+
+// ---- 恢复演练 (backup drill) ----
+
+// DrillCheck 是恢复演练中单项检查的结果。
+type DrillCheck struct {
+	Name   string `json:"name"`
+	OK     bool   `json:"ok"`
+	Detail string `json:"detail"`
+}
+
+// DrillReport 是一次恢复演练的完整报告。
+type DrillReport struct {
+	OK          bool         `json:"ok"`
+	Name        string       `json:"name"`
+	Size        int64        `json:"size"`
+	CreatedAt   string       `json:"created_at"`
+	Checks      []DrillCheck `json:"checks"`
+	FileCount   int          `json:"file_count"`
+	FolderCount int          `json:"folder_count"`
+	DurationMS  int64        `json:"duration_ms"`
+	Error       string       `json:"error,omitempty"`
+}
+
+// drillBackupFile 把备份复制到临时目录，走与真实恢复启动完全相同的路径
+// （db.New → 建表/迁移 → 全量查询）做只读体检，全程不触碰线上数据库、
+// 不写 .restore 暂存文件，因此可反复执行、无需 MFA 二次验证。
+func drillBackupFile(backupPath string) DrillReport {
+	start := time.Now()
+	report := DrillReport{Name: filepath.Base(backupPath)}
+
+	pass := func(name, detail string) {
+		report.Checks = append(report.Checks, DrillCheck{Name: name, OK: true, Detail: detail})
+	}
+	fail := func(name, detail string) DrillReport {
+		report.Checks = append(report.Checks, DrillCheck{Name: name, OK: false, Detail: detail})
+		report.Error = detail
+		report.DurationMS = time.Since(start).Milliseconds()
+		return report
+	}
+
+	info, err := os.Stat(backupPath)
+	if err != nil {
+		return fail("备份文件", err.Error())
+	}
+	report.Size = info.Size()
+	report.CreatedAt = info.ModTime().Format(time.RFC3339)
+	pass("备份文件", fmt.Sprintf("%s（%d 字节）", filepath.Base(backupPath), info.Size()))
+
+	tmpDir, err := os.MkdirTemp("", "lit-aoss-drill-*")
+	if err != nil {
+		return fail("临时目录", err.Error())
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// 与恢复暂存等价的字节级拷贝，绝不动线上文件
+	src, err := os.Open(backupPath)
+	if err != nil {
+		return fail("复制备份", err.Error())
+	}
+	dstPath := filepath.Join(tmpDir, "backup.db")
+	dst, err := os.OpenFile(dstPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if err != nil {
+		src.Close()
+		return fail("复制备份", err.Error())
+	}
+	_, err = io.Copy(dst, src)
+	src.Close()
+	if cerr := dst.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return fail("复制备份", err.Error())
+	}
+	pass("字节级拷贝", "已复制到临时目录（不写 .restore，不碰线上数据）")
+
+	// db.New = 恢复后重启所执行的同一套初始化（建表 + 全量迁移 + 补列回填）
+	d, err := db.New(dstPath)
+	if err != nil {
+		return fail("打开与迁移", err.Error())
+	}
+	defer d.Close()
+	pass("打开与迁移", "建表与迁移全部通过（含历史库补列回填）")
+
+	setup, err := d.IsSetupComplete()
+	if err != nil {
+		return fail("账号数据", err.Error())
+	}
+	if !setup {
+		return fail("账号数据", "主密码哈希或加密密钥缺失，恢复后将无法登录")
+	}
+	pass("账号数据", "主密码哈希与加密密钥齐备")
+
+	statRows, err := d.GetFileStatRows()
+	if err != nil {
+		return fail("文件全量扫描", err.Error())
+	}
+	for _, r := range statRows {
+		if r.IsDirectory {
+			report.FolderCount++
+		} else {
+			report.FileCount++
+		}
+	}
+	pass("文件全量扫描", fmt.Sprintf("%d 个文件 / %d 个目录", report.FileCount, report.FolderCount))
+
+	root, err := d.GetFiles(nil)
+	if err != nil {
+		return fail("根目录文件列表", err.Error())
+	}
+	pass("根目录文件列表", fmt.Sprintf("%d 条根目录记录可正常读取", len(root)))
+
+	mfa, err := d.GetMFA()
+	if err != nil {
+		return fail("MFA 状态表", err.Error())
+	}
+	if mfa != nil {
+		pass("MFA 状态表", "MFA 记录可读取")
+	} else {
+		pass("MFA 状态表", "未启用 MFA（表结构可读）")
+	}
+
+	report.OK = true
+	report.DurationMS = time.Since(start).Milliseconds()
+	return report
+}
+
+// BackupDrill 恢复演练：验证指定备份（缺省为最新一份）能被真实恢复流程打开、
+// 迁移并读取。只读操作，始终以 200 返回体检报告（ok=false 表示体检失败，
+// 由前端渲染失败项），仅“找不到备份”时返回 404。
+func (h *Handler) BackupDrill(c *gin.Context) {
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil && err != io.EOF {
+		c.JSON(http.StatusBadRequest, gin.H{"ok": false, "error": "invalid request"})
+		return
+	}
+	if strings.Contains(req.Name, "/") || strings.Contains(req.Name, "\\") || strings.Contains(req.Name, "..") {
+		c.JSON(http.StatusBadRequest, gin.H{"ok": false, "error": "invalid backup name"})
+		return
+	}
+
+	backupDir := filepath.Join(filepath.Dir(h.config.Database.Path), "backups")
+	backupPath := ""
+
+	if req.Name != "" {
+		backupPath = filepath.Join(backupDir, req.Name)
+		if _, err := os.Stat(backupPath); os.IsNotExist(err) {
+			c.JSON(http.StatusNotFound, gin.H{"ok": false, "error": "backup not found"})
+			return
+		}
+	} else {
+		// 与 ListBackups 相同的命名规则，取修改时间最新的一份
+		entries, err := os.ReadDir(backupDir)
+		if err == nil {
+			var latest string
+			var latestMod time.Time
+			for _, e := range entries {
+				if e.IsDir() || !strings.HasPrefix(e.Name(), "lit-aoss_") || !strings.HasSuffix(e.Name(), ".db") {
+					continue
+				}
+				if info, ierr := e.Info(); ierr == nil && info.ModTime().After(latestMod) {
+					latestMod = info.ModTime()
+					latest = e.Name()
+				}
+			}
+			if latest != "" {
+				backupPath = filepath.Join(backupDir, latest)
+			}
+		}
+		if backupPath == "" {
+			c.JSON(http.StatusNotFound, gin.H{"ok": false, "error": "no backups found"})
+			return
+		}
+	}
+
+	report := drillBackupFile(backupPath)
+	log.Printf("Backup drill %s: ok=%v (%dms)", report.Name, report.OK, report.DurationMS)
+	c.JSON(http.StatusOK, gin.H{"ok": report.OK, "report": report})
+}

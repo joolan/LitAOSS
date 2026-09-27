@@ -16,7 +16,9 @@ export default function LoginScreen({ onUnlock }: LoginScreenProps) {
   const [cryptoError, setCryptoError] = useState('');
 
   useEffect(() => {
-    api.getSetupStatus().then(res => setIsSetup(res.setup_complete));
+    api.getSetupStatus()
+      .then(res => setIsSetup(res.setup_complete))
+      .catch(() => setIsSetup(true)); // 后端不可达（离线/启动中）默认按已初始化渲染登录页，避免永远卡在「加载中」
     // 非安全上下文（HTTP + 非 localhost）下浏览器禁用 crypto.subtle，所有加密操作会直接抛错
     if (typeof crypto === 'undefined' || !crypto.subtle) {
       setCryptoError(

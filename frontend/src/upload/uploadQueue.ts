@@ -1,5 +1,6 @@
 import { api } from '../api/client';
 import { encryptNameForStorage, decryptNameForStorage, wrapFileKeyForStorage } from '../crypto/fileKey';
+import { contentHash } from '../contentHash';
 
 export interface UploadHandle {
   promise: Promise<void>;
@@ -21,6 +22,34 @@ export function encryptAndUploadFile(
 
   const promise = (async () => {
     const arrayBuffer = await file.arrayBuffer();
+    if (aborted) throw new Error('已取消');
+
+    // 内容寻址查重：命中则跳过加密与 OSS 上传，复用既有密文对象建记录
+    let hash = '';
+    try {
+      hash = await contentHash(arrayBuffer);
+      const dup = await api.checkDedup(hash);
+      if (dup.found && dup.file) {
+        const nameEncrypted = await encryptNameForStorage(file.name);
+        await api.createFileRecord({
+          name_encrypted: nameEncrypted,
+          parent_id: parentId || undefined,
+          file_size: dup.file.file_size,
+          file_type: dup.file.file_type || file.type,
+          encrypted_file_key: dup.file.encrypted_file_key || '',
+          iv: dup.file.iv || '',
+          salt: dup.file.salt || '',
+          oss_key: dup.file.oss_key,
+          content_hash: hash,
+        });
+        onProgress(1);
+        return;
+      }
+    } catch (err) {
+      if (aborted) throw new Error('已取消');
+      // 查重失败不阻断上传，走正常加密上传
+      hash = hash || '';
+    }
     if (aborted) throw new Error('已取消');
 
     const iv = crypto.getRandomValues(new Uint8Array(12));
@@ -70,6 +99,7 @@ export function encryptAndUploadFile(
       iv: Array.from(iv),
       salt: [],
       oss_key: ossKeyRes.oss_key,
+      content_hash: hash,
     });
   })();
 

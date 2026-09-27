@@ -1,7 +1,7 @@
 import { useState, useEffect, type ComponentType } from 'react';
 import { X, Download, ZoomIn, ZoomOut, RotateCcw } from 'lucide-react';
 import { FileRecord } from '../api/client';
-import { resolvePreview, decryptFileContent, type PreviewRenderProps } from '../preview';
+import { resolvePreview, decryptFileContent, generateThumb, getThumb, putThumb, thumbKey, type PreviewRenderProps } from '../preview';
 
 interface FilePreviewProps {
   file: FileRecord;
@@ -51,6 +51,12 @@ export default function FilePreview({ file, fileName, onClose }: FilePreviewProp
       if (preview.kind === 'image') {
         const blob = new Blob([content], { type: file.file_type || 'image/png' });
         setImageUrl(URL.createObjectURL(blob));
+        // 预览成功后生成小缩略图缓存（供网格视图显示，失败不影响预览）
+        generateThumb(blob)
+          .then((thumb) => {
+            if (thumb) putThumb(thumbKey(file), thumb);
+          })
+          .catch(() => {});
       } else if (preview.kind === 'text') {
         setTextContent(new TextDecoder().decode(content));
       } else {

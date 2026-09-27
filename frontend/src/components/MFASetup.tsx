@@ -1,8 +1,24 @@
 import { useState, useEffect, useRef } from 'react';
-import { Shield, AlertCircle, Check, X, QrCode, Copy } from 'lucide-react';
+import { Shield, AlertCircle, Check, X, QrCode, Copy, KeyRound, Download, RefreshCw } from 'lucide-react';
 import QRCode from 'qrcode';
 import { api } from '../api/client';
-import { getSessionSalt } from '../session';
+import { getSessionPassword, getSessionSalt } from '../session';
+
+// 由主密码推导 auth_hash（与登录一致的 PBKDF2-500k），用于 mfaSetup/mfaDisable 的服务端口令验证
+async function deriveAuthHash(password: string): Promise<string | null> {
+  const storedSalt = getSessionSalt();
+  if (!storedSalt) return null;
+  const enc = new TextEncoder();
+  const keyMaterial = await crypto.subtle.importKey(
+    'raw', enc.encode(password), 'PBKDF2', false, ['deriveBits']
+  );
+  const saltBytes = Uint8Array.from(atob(storedSalt), c => c.charCodeAt(0));
+  const bits = await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', salt: saltBytes, iterations: 500000, hash: 'SHA-256' },
+    keyMaterial, 256
+  );
+  return btoa(String.fromCharCode(...new Uint8Array(bits)));
+}
 
 interface MFASetupProps {
   onClose: () => void;
@@ -21,6 +37,10 @@ export default function MFASetup({ onClose }: MFASetupProps) {
   const [success, setSuccess] = useState('');
   const [mfaEnabled, setMfaEnabled] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [recoveryTotal, setRecoveryTotal] = useState(0);
+  const [recoveryRemaining, setRecoveryRemaining] = useState(0);
+  const [freshCodes, setFreshCodes] = useState<string[] | null>(null);
+  const [codesCopied, setCodesCopied] = useState(false);
 
   useEffect(() => {
     checkMfaStatus();
@@ -40,9 +60,17 @@ export default function MFASetup({ onClose }: MFASetupProps) {
     try {
       const res = await api.mfaStatus();
       setMfaEnabled(res.enabled);
+      setRecoveryTotal(res.recovery_total || 0);
+      setRecoveryRemaining(res.recovery_remaining || 0);
       setMode(res.enabled ? 'manage' : 'bind');
       if (!res.enabled && !res.setup) {
-        const setupRes = await api.mfaSetup();
+        const pw = getSessionPassword();
+        const authHash = pw ? await deriveAuthHash(pw) : null;
+        if (!authHash) {
+          setError('会话已过期，请重新登录');
+          return;
+        }
+        const setupRes = await api.mfaSetup({ password_hash: authHash });
         setSecret(setupRes.secret);
         setUri(setupRes.uri);
       }
@@ -89,21 +117,11 @@ export default function MFASetup({ onClose }: MFASetupProps) {
     setActionLoading(true);
     setError('');
     try {
-      const storedSalt = getSessionSalt();
-      if (!storedSalt) {
+      const authHash = await deriveAuthHash(disablePassword);
+      if (!authHash) {
         setError('会话已过期，请重新登录');
         return;
       }
-      const enc = new TextEncoder();
-      const keyMaterial = await crypto.subtle.importKey(
-        'raw', enc.encode(disablePassword), 'PBKDF2', false, ['deriveBits']
-      );
-      const saltBytes = Uint8Array.from(atob(storedSalt), c => c.charCodeAt(0));
-      const bits = await crypto.subtle.deriveBits(
-        { name: 'PBKDF2', salt: saltBytes, iterations: 500000, hash: 'SHA-256' },
-        keyMaterial, 256
-      );
-      const authHash = btoa(String.fromCharCode(...new Uint8Array(bits)));
 
       const res = await api.mfaDisable({ code: totpCode, password_hash: authHash });
       if (res.ok) {
@@ -112,7 +130,10 @@ export default function MFASetup({ onClose }: MFASetupProps) {
         setMode('bind');
         setTotpCode('');
         setDisablePassword('');
-        const setupRes = await api.mfaSetup();
+        setRecoveryTotal(0);
+        setRecoveryRemaining(0);
+        setFreshCodes(null);
+        const setupRes = await api.mfaSetup({ password_hash: authHash });
         setSecret(setupRes.secret);
         setUri(setupRes.uri);
       } else {
@@ -129,6 +150,57 @@ export default function MFASetup({ onClose }: MFASetupProps) {
     navigator.clipboard.writeText(secret);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
+  };
+
+  const handleGenerateRecovery = async () => {
+    setActionLoading(true);
+    setError('');
+    try {
+      const pw = getSessionPassword();
+      const authHash = pw ? await deriveAuthHash(pw) : null;
+      if (!authHash) {
+        setError('会话已过期，请重新登录');
+        return;
+      }
+      const res = await api.generateRecoveryCodes({ password_hash: authHash });
+      if (res.ok) {
+        setFreshCodes(res.codes);
+        setRecoveryTotal(res.total);
+        setRecoveryRemaining(res.total);
+        setCodesCopied(false);
+        setSuccess('');
+      } else {
+        setError('生成恢复码失败');
+      }
+    } catch (err: any) {
+      setError(err.message || '生成恢复码失败');
+    } finally {
+      setActionLoading(false);
+    }
+  };
+
+  const copyCodes = () => {
+    if (!freshCodes) return;
+    navigator.clipboard.writeText(freshCodes.join('\n'));
+    setCodesCopied(true);
+    setTimeout(() => setCodesCopied(false), 2000);
+  };
+
+  const downloadCodes = () => {
+    if (!freshCodes) return;
+    const text =
+      `LitAOSS MFA 恢复码（生成于 ${new Date().toLocaleString('zh-CN')}）\n` +
+      '每个恢复码仅可使用一次，请离线保存（密码管理器/打印件）。\n' +
+      '丢失认证器时，在 MFA 验证页选择「使用恢复码」登录。\n\n' +
+      freshCodes.join('\n') +
+      '\n';
+    const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'lit-aoss-recovery-codes.txt';
+    a.click();
+    URL.revokeObjectURL(url);
   };
 
   if (loading) {
@@ -208,6 +280,76 @@ export default function MFASetup({ onClose }: MFASetupProps) {
             <Shield className="w-4 h-4 flex-shrink-0" />
             MFA 已启用
           </div>
+
+          <div className="p-4 rounded-lg bg-gray-800 border border-gray-700 space-y-3">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2 text-sm text-gray-300">
+                <KeyRound className="w-4 h-4 text-emerald-400" />
+                登录恢复码
+              </div>
+              {freshCodes ? (
+                <span className="text-xs text-amber-400">仅此一次显示</span>
+              ) : recoveryRemaining > 0 ? (
+                <span className="text-xs text-emerald-400">已生成 · 剩余 {recoveryRemaining}/{recoveryTotal}</span>
+              ) : (
+                <span className="text-xs text-red-400">未生成</span>
+              )}
+            </div>
+
+            {freshCodes ? (
+              <>
+                <p className="text-xs text-amber-400">
+                  请立即复制或下载并离线保存——离开此页后无法再次查看。每个码仅可使用一次。
+                </p>
+                <div className="grid grid-cols-2 gap-2">
+                  {freshCodes.map((code) => (
+                    <code key={code} className="block text-sm font-mono text-emerald-400 bg-gray-900 rounded px-2 py-1.5 text-center tracking-wider">
+                      {code}
+                    </code>
+                  ))}
+                </div>
+                <div className="flex gap-2">
+                  <button
+                    onClick={copyCodes}
+                    className="flex-1 flex items-center justify-center gap-1.5 py-2 bg-gray-700 hover:bg-gray-600 text-white text-sm rounded-lg transition-colors"
+                  >
+                    {codesCopied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                    {codesCopied ? '已复制' : '复制全部'}
+                  </button>
+                  <button
+                    onClick={downloadCodes}
+                    className="flex-1 flex items-center justify-center gap-1.5 py-2 bg-gray-700 hover:bg-gray-600 text-white text-sm rounded-lg transition-colors"
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                    下载 txt
+                  </button>
+                </div>
+                <button
+                  onClick={() => setFreshCodes(null)}
+                  className="w-full py-2 bg-emerald-600 hover:bg-emerald-500 text-white text-sm rounded-lg transition-colors"
+                >
+                  我已安全保存
+                </button>
+              </>
+            ) : (
+              <>
+                <p className="text-xs text-gray-400">
+                  {recoveryRemaining > 0
+                    ? '丢失认证器时可用恢复码登录；重新生成会使以下旧码全部失效。'
+                    : '未生成恢复码：一旦丢失认证器将无法登录。建议启用后立即生成并离线保存。'}
+                </p>
+                <button
+                  onClick={handleGenerateRecovery}
+                  disabled={actionLoading}
+                  className="w-full flex items-center justify-center gap-1.5 py-2 bg-gray-700 hover:bg-gray-600 disabled:opacity-50 text-white text-sm rounded-lg transition-colors"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${actionLoading ? 'animate-spin' : ''}`} />
+                  {recoveryRemaining > 0 ? '重新生成（旧码全部失效）' : '生成 10 个恢复码'}
+                </button>
+              </>
+            )}
+          </div>
+
           <p className="text-sm text-gray-400">
             禁用 MFA 需要输入密码和当前验证码进行确认。
           </p>

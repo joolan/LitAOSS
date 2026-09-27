@@ -63,7 +63,7 @@ async function getMasterKeyCandidates(): Promise<CryptoKey[]> {
   return Promise.all([getMasterKey(''), getMasterKey('account-key')]);
 }
 
-async function getAccountKey(): Promise<CryptoKey> {
+export async function getAccountKey(): Promise<CryptoKey> {
   const wrappedAccountKey = getSessionEncryptedAccountKey();
   if (!wrappedAccountKey) throw new Error('未解锁');
 

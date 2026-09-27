@@ -83,23 +83,39 @@ LitAOSS 是一个端到端加密的私有存储系统。文件在浏览器端完
 逐个上传: 按相对路径逐级确保存在目标文件夹 (已存在则复用，否则创建，会话内缓存)
     │
     ▼
+计算内容哈希 (HMAC-SHA256，密钥由 Account Key HKDF 派生，改主密码不影响) → /files/dedup-check 查重
+    │
+    ├─ 命中: 跳过加密与上传，直接复用既有文件的
+    │        oss_key/File Key/IV/Salt 建新记录 (同内容同一密文对象)
+    │
+    └─ 未命中:
+        ▼
 浏览器生成随机 File Key (AES-256)
-    │
-    ▼
+        │
+        ▼
 AES-GCM 加密文件内容 (每文件独立 IV)
-    │
-    ▼
+        │
+        ▼
 AES-KW 包装 File Key (用 Account Key)
-    │
-    ▼
+        │
+        ▼
 请求 Go 后端生成预签名上传 URL (AK/SK 仅在后端)
-    │
-    ▼
+        │
+        ▼
 浏览器直传加密 blob 到 OSS (不经后端)
-    │
-    ▼
-后端保存文件元数据 (加密文件名、加密 File Key、OSS Key)
+        │
+        ▼
+后端保存文件元数据 (加密文件名、加密 File Key、OSS Key、content_hash)
 ```
+
+**共享密文对象不变量（去重命中时多条记录指向同一 `oss_key`）:**
+
+- 文本编辑/内容更新**永远生成新 `oss_key` 并上传新对象**，从不原地覆盖旧对象；
+  其他仍引用旧对象的记录不受影响，内容各自独立
+- 版本历史行对旧对象只是**只读引用**；恢复版本仅重指 `oss_key` 并清空 `content_hash`
+- `deleted_objects` 台账记录的是"该文件记录被删时对象仍存在"，**不是**
+  "对象可物理删除"的凭据——共享对象可能仍被其他有效记录引用；
+  若未来实现物理清理，必须先按 `content_hash`/`oss_key` 检查是否仍被引用
 
 #### 下载/预览流程
 
@@ -178,12 +194,12 @@ File Key + AES-GCM 解密
 | 保证 | 实现方式 |
 |------|----------|
 | 零知识 | Master Key 仅在浏览器内存，服务端无任何明文密钥 |
-| 抗暴力破解 | PBKDF2 500k 迭代 + 最少 12 字符密码 + 5 次失败锁定 |
+| 抗暴力破解 | PBKDF2 500k 迭代 + 最少 12 字符密码 + 5 次失败全局锁定（登录成功清零计数） |
 | 抗篡改 | AES-GCM 认证加密，任何篡改都会被检测 |
 | 密钥隔离 | 每文件独立密钥，单文件泄露不影响其他文件 |
 | SecretKey 保护 | 加密存储于配置文件，使用时解密 |
 | 数据库加密 | 停止服务后自动加密数据库文件 |
-| 预签名 URL | 有时效、限路径，AK/SK 不暴露给前端 |
+| 预签名 URL | 有时效、仅放行 `files/` 命名空间，AK/SK 不暴露给前端 |
 
 ### 3.3 加密参数
 
@@ -205,7 +221,7 @@ File Key + AES-GCM 解密
 -- 认证表
 CREATE TABLE auth (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    password_hash TEXT NOT NULL,      -- PBKDF2 派生的 Auth Hash
+    password_hash TEXT NOT NULL,      -- argon2id 包裹的 Auth Hash（防库拖重放）
     salt TEXT NOT NULL,               -- PBKDF2 salt (Base64)
     encrypted_account_key BLOB,       -- 加密后的 Account Key
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -278,6 +294,16 @@ db-backups/{lit-aoss_<ts>}.db.enc
 | POST | /api/auth/login | 登录验证（成功响应含后端版本号 `version`，仅此认证成功路径返回） |
 | GET | /api/auth/salt | 获取 salt (用于客户端密钥派生) |
 | POST | /api/auth/update-key | 更新加密密钥 |
+| GET | /api/auth/login-history | 最近 50 条登录尝试（成功/失败/IP） |
+| GET | /api/auth/login-stats | 近 N 天每日成功登录次数（默认 30 天） |
+| POST | /api/auth/verify-totp | TOTP 验证（pending 会话 → 完整会话） |
+| POST | /api/auth/verify-recovery | 恢复码验证（一次性消费，与 TOTP 共用锁定） |
+| POST | /api/auth/verify-totp-delete | 删除操作的 TOTP 二次验证（每会话一次） |
+| POST | /api/mfa/setup | 生成 TOTP 密钥与二维码（需主密码验证，防会话偷换认证器） |
+| POST | /api/mfa/enable | 启用 MFA |
+| POST | /api/mfa/disable | 禁用 MFA（同时清空恢复码） |
+| POST | /api/mfa/recovery-codes | 生成/重生成 10 个恢复码（明文仅返回一次；需主密码验证） |
+| GET | /api/mfa/status | MFA 状态 + 恢复码统计 |
 
 ### 5.2 文件操作
 
@@ -311,7 +337,9 @@ db-backups/{lit-aoss_<ts>}.db.enc
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | /api/stats | 获取存储统计 |
+| GET | /api/stats | 获取存储统计（仅根目录直下） |
+| GET | /api/stats/summary | 全库统计：总量/类型分布/顶层目录占用 Top10（目录名加密返回） |
+| GET | /api/auth/login-stats | 近 N 天每日成功登录次数（默认 30 天） |
 
 ### 5.6 备份管理
 
@@ -323,6 +351,7 @@ db-backups/{lit-aoss_<ts>}.db.enc
 | GET | /api/backup/list | 本地备份列表 + OSS 上传台账（`data/backups/oss-ledger.json`） |
 | POST | /api/backup/restore | 本地恢复（需 delete-MFA，恢复前安全快照） |
 | POST | /api/backup/restore-oss | 从 OSS 下载加密备份恢复（需 delete-MFA，校验台账白名单） |
+| POST | /api/backup/drill | 恢复演练：备份复制到临时目录后走真实恢复启动路径只读体检（只读，无需 delete-MFA） |
 
 备份触发路径统一走 `BackupManager.RunBackup(uploadOSS)`：
 - 快照方式: `VACUUM INTO`（含 WAL 未 checkpoint 数据的一致性快照；文件拷贝会得到旧内容且 md5 恒定）
@@ -382,9 +411,11 @@ LitAOSS/
 │   │   │   ├── LoginScreen.tsx           # 登录/初始化界面
 │   │   │   ├── FileExplorer.tsx          # 文件管理器 (核心)
 │   │   │   ├── UploadQueueDialog.tsx     # 上传队列弹窗（确认/进度/重试）
+│   │   │   ├── FolderPicker.tsx          # 移动目标文件夹选择器（批量移动）
 │   │   │   ├── FilePreview.tsx           # 文件预览
 │   │   │   ├── TextEditor.tsx            # 文本编辑器
-│   │   │   └── Settings.tsx              # SecretKey 加密设置
+│   │   │   ├── Settings.tsx              # 设置弹窗（加密工具/密钥/密码/MFA/备份/登录历史）
+│   │   │   └── LoginHistory.tsx          # 最近登录尝试列表（成功/失败/IP）
 │   │   ├── App.tsx                       # 主应用
 │   │   ├── main.tsx                      # 入口
 │   │   └── index.css                     # 全局样式
