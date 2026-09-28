@@ -152,6 +152,9 @@ func main() {
 		protected.DELETE("/files/:id", handler.DeleteFile)
 		protected.POST("/files/batch-delete", handler.BatchDelete)
 		protected.GET("/deleted-objects", handler.GetDeletedObjects)
+		protected.GET("/trash", handler.ListTrash)
+		protected.POST("/trash/purge", handler.PurgeTrash)
+		protected.POST("/trash/:id/restore", handler.RestoreFile)
 
 		protected.POST("/folders", handler.CreateFolder)
 
@@ -164,6 +167,7 @@ func main() {
 		protected.GET("/stats/summary", handler.GetStatsSummary)
 		protected.GET("/auth/login-history", handler.GetLoginHistory)
 		protected.GET("/auth/login-stats", handler.GetLoginStats)
+		protected.GET("/audit", handler.ListAudit)
 
 		protected.GET("/backup/config", handler.GetBackupConfig)
 		protected.POST("/backup/config", handler.UpdateBackupConfig)
@@ -177,9 +181,39 @@ func main() {
 	addr := fmt.Sprintf("%s:%s", cfg.Server.Host, cfg.Server.Port)
 	log.Printf("Server starting on %s", addr)
 	startBackupScheduler(cfg, store, encryptedDB.Database, ossLedger)
+	startTrashPurgeScheduler(cfg, encryptedDB.Database)
 	if err := router.Run(addr); err != nil {
 		log.Fatalf("server: %v", err)
 	}
+}
+
+// startTrashPurgeScheduler 每日一次（启动时补跑）物理清理超期回收站、
+// 过期删除台账与过期操作审计。retention_days<=0 时回收站永不自动清理。
+func startTrashPurgeScheduler(cfg *config.Config, database *db.Database) {
+	go func() {
+		run := func() {
+			if n, err := database.PurgeExpiredTrash(cfg.Trash.RetentionDays); err != nil {
+				log.Printf("trash purge failed: %v", err)
+			} else if n > 0 {
+				log.Printf("trash purge: %d rows removed (retention %d days)", n, cfg.Trash.RetentionDays)
+			}
+			if n, err := database.PurgeDeletedObjectsOlderThan(90); err != nil {
+				log.Printf("deleted_objects purge failed: %v", err)
+			} else if n > 0 {
+				log.Printf("deleted_objects purge: %d rows older than 90d", n)
+			}
+			if n, err := database.PurgeAuditOlderThan(180); err != nil {
+				log.Printf("audit purge failed: %v", err)
+			} else if n > 0 {
+				log.Printf("audit purge: %d rows older than 180d", n)
+			}
+		}
+		run()
+		for {
+			time.Sleep(24 * time.Hour)
+			run()
+		}
+	}()
 }
 
 // startBackupScheduler 每 30 秒重读配置触发当日定时备份：

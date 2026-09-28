@@ -310,6 +310,10 @@ cp backend/config.example.json backend/config.json   # Windows: copy
 | `server.allowed_origin` | 允许访问的前端域名，留空则仅允许 localhost |
 | `oss.encrypted_sk` | 加密后的 SecretKey，留空则使用明文 `secret_key` |
 | `backup.*` | 自动备份、文件变更触发、OSS 加密上传各开关 |
+| `alert.webhook_url` | 登录失败告警 webhook，留空关闭；同 IP 锁定窗口内失败达阈值后 POST JSON（5s 超时） |
+| `alert.fail_threshold` | 触发告警的失败次数阈值，默认 5（<=0 视为 5） |
+| `alert.cooldown_seconds` | 同一 IP 告警冷却秒数，默认 600（<=0 视为 600） |
+| `trash.retention_days` | 回收站保留天数，默认 30；0 = 从不自动清理 |
 
 ### 5.2 加密 SecretKey
 

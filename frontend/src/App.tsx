@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from 'react';
 import { api, setSessionToken } from './api/client';
 import { deriveMasterKey, unwrapAccountKey } from './crypto/crypto';
 import { setUnlockMaterial, clearUnlockMaterial } from './session';
-import { clearThumbCache } from './preview';
+import { clearThumbCache, clearOfflineCache } from './preview';
 import { clearPlainCache } from './plainCache';
 import LoginScreen from './components/LoginScreen';
 import FileExplorer from './components/FileExplorer';
@@ -206,10 +206,11 @@ export default function App() {
   }, [state]);
 
   // 安全清理：页面加载/刷新、登录页与 MFA 页出现（登录前）、锁定或空闲
-  // 退出回到登录页时，清空缩略图（IndexedDB）与内存明文缓存，避免解密数据残留
+  // 退出回到登录页时，清空缩略图与离线预览缓存（IndexedDB）及内存明文缓存
   useEffect(() => {
     if (state !== 'unlocked') {
       clearThumbCache().catch(() => {});
+      clearOfflineCache().catch(() => {});
       clearPlainCache();
     }
   }, [state]);

@@ -65,6 +65,40 @@ export interface LoginAttempt {
   created_at: string;
 }
 
+export type AuditAction =
+  | 'upload'
+  | 'download'
+  | 'delete'
+  | 'rename'
+  | 'move'
+  | 'edit'
+  | 'change_password'
+  | 'create_folder'
+  | 'restore'
+  | 'purge_trash';
+
+export interface AuditEntry {
+  id: number;
+  action: AuditAction;
+  target_type: string;
+  target_id: string;
+  // 文件为密文名（会话内解密）；rename 的 detail 存旧密文名，move 的 detail 存目标目录密文名
+  target_name: string;
+  detail: string;
+  ip_address: string;
+  created_at: string;
+}
+
+export interface TrashItem {
+  id: string;
+  // 密文名（会话内解密展示）
+  name_encrypted: string;
+  is_directory: boolean;
+  file_size: number;
+  parent_id: string | null;
+  deleted_at: string;
+}
+
 export interface StatsSummary {
   totals: { total_size: number; file_count: number; folder_count: number };
   types: { file_type: string; count: number; size: number }[];
@@ -236,10 +270,11 @@ export const api = {
       body: JSON.stringify({ oss_key: ossKey, expires }),
     }),
 
-  getPresignDownloadUrl: (ossKey: string, expires = 3600) =>
+  // purpose='download' 时后端记入下载审计；预览/编辑器加载不传（不计入下载计量）
+  getPresignDownloadUrl: (ossKey: string, expires = 3600, purpose = '') =>
     request<{ url: string }>('/presign/download', {
       method: 'POST',
-      body: JSON.stringify({ oss_key: ossKey, expires }),
+      body: JSON.stringify({ oss_key: ossKey, expires, purpose }),
     }),
 
   generateOSSKey: (folder = 'files') =>
@@ -248,6 +283,26 @@ export const api = {
   getStats: () => request<{ total_size: number; file_count: number; folder_count: number }>('/stats'),
 
   getLoginHistory: () => request<{ attempts: LoginAttempt[] }>('/auth/login-history'),
+
+  listAudit: (params: { page?: number; page_size?: number; action?: string } = {}) => {
+    const q = new URLSearchParams();
+    if (params.page) q.set('page', String(params.page));
+    if (params.page_size) q.set('page_size', String(params.page_size));
+    if (params.action) q.set('action', params.action);
+    const qs = q.toString();
+    return request<{ items: AuditEntry[]; total: number }>(`/audit${qs ? `?${qs}` : ''}`);
+  },
+
+  // 回收站：retention_days=0 表示从不自动清理
+  listTrash: () =>
+    request<{ items: TrashItem[]; retention_days: number }>('/trash'),
+
+  restoreFile: (id: string) =>
+    request<{ ok: boolean; parent_id: string | null }>(`/trash/${id}/restore`, { method: 'POST' }),
+
+  // 清空为不可逆操作，后端与删除同受 MFA 二次验证保护
+  purgeTrash: () =>
+    request<{ ok: boolean; purged: number }>('/trash/purge', { method: 'POST' }),
 
   getStatsSummary: () => request<StatsSummary>('/stats/summary'),
 

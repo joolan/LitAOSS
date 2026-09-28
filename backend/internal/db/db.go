@@ -142,6 +142,18 @@ func (d *Database) migrate() error {
 			created_at TEXT NOT NULL DEFAULT (datetime('now'))
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_mfa_recovery_codes_hash ON mfa_recovery_codes(code_hash)`,
+		`CREATE TABLE IF NOT EXISTS audit_log (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			action TEXT NOT NULL,
+			target_type TEXT NOT NULL DEFAULT '',
+			target_id TEXT NOT NULL DEFAULT '',
+			target_name TEXT NOT NULL DEFAULT '',
+			detail TEXT NOT NULL DEFAULT '',
+			ip_address TEXT NOT NULL DEFAULT '',
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_log(created_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_log(action, created_at)`,
 	}
 
 	for _, q := range queries {
@@ -339,6 +351,19 @@ func (d *Database) GetFailedLoginCount(since time.Duration) (int, error) {
 	return count, nil
 }
 
+// GetFailedLoginCountByIP 指定 IP 在窗口内的失败次数（登录失败告警阈值判定）
+func (d *Database) GetFailedLoginCountByIP(ip string, since time.Duration) (int, error) {
+	var count int
+	err := d.conn.QueryRow(
+		"SELECT COUNT(*) FROM login_attempts WHERE success = 0 AND ip_address = ? AND created_at > datetime('now', ?)",
+		ip, sqliteSinceModifier(since),
+	).Scan(&count)
+	if err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
 // GetLoginHistory 按时间倒序返回最近 limit 条登录尝试（成功登录后失败记录
 // 会被清零，因此表中通常是「全部成功记录 + 距上次成功以来的失败」）。
 func (d *Database) GetLoginHistory(limit int) ([]models.LoginAttempt, error) {
@@ -368,6 +393,95 @@ func (d *Database) GetLoginHistory(limit int) ([]models.LoginAttempt, error) {
 		out = append(out, a)
 	}
 	return out, rows.Err()
+}
+
+// RecordAudit 写入一条操作审计（调用方失败仅记日志，不影响业务）
+func (d *Database) RecordAudit(action, targetType, targetID, targetName, detail, ip string) error {
+	_, err := d.conn.Exec(
+		`INSERT INTO audit_log (action, target_type, target_id, target_name, detail, ip_address)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		action, targetType, targetID, targetName, detail, ip,
+	)
+	return err
+}
+
+// ListAudit 分页查询操作审计（按 id 倒序）；action 为空表示不过滤
+func (d *Database) ListAudit(page, pageSize int, action string) ([]models.AuditEntry, int, error) {
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 || pageSize > 200 {
+		pageSize = 50
+	}
+
+	where := ""
+	args := []any{}
+	if action != "" {
+		where = "WHERE action = ?"
+		args = append(args, action)
+	}
+
+	var total int
+	if err := d.conn.QueryRow("SELECT COUNT(*) FROM audit_log "+where, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+
+	rows, err := d.conn.Query(
+		`SELECT id, action, target_type, target_id, target_name, detail, ip_address, created_at
+		 FROM audit_log `+where+` ORDER BY id DESC LIMIT ? OFFSET ?`,
+		append(args, pageSize, (page-1)*pageSize)...,
+	)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	out := make([]models.AuditEntry, 0)
+	for rows.Next() {
+		var a models.AuditEntry
+		var created string
+		if err := rows.Scan(&a.ID, &a.Action, &a.TargetType, &a.TargetID,
+			&a.TargetName, &a.Detail, &a.IPAddress, &created); err != nil {
+			return nil, 0, err
+		}
+		if t, err := time.Parse("2006-01-02 15:04:05", created); err == nil {
+			a.CreatedAt = t
+		} else if t, err := time.Parse(time.RFC3339, created); err == nil {
+			a.CreatedAt = t
+		}
+		out = append(out, a)
+	}
+	return out, total, rows.Err()
+}
+
+// PurgeAuditOlderThan 清理超过保留期的操作审计，返回删除行数；days<=0 表示永不清理
+func (d *Database) PurgeAuditOlderThan(days int) (int64, error) {
+	if days <= 0 {
+		return 0, nil
+	}
+	res, err := d.conn.Exec(
+		"DELETE FROM audit_log WHERE created_at < datetime('now', ?)",
+		fmt.Sprintf("-%d days", days),
+	)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// FindFileNameByOSSKey 下载审计反查：对象键可能是主对象或历史版本对象，
+// 两者都查以保证文件名（密文）可回填到审计记录
+func (d *Database) FindFileNameByOSSKey(ossKey string) (string, string, error) {
+	var fileID, name string
+	err := d.conn.QueryRow(
+		`SELECT id, name_encrypted FROM files WHERE oss_key = ?
+		 UNION ALL
+		 SELECT v.file_id, f.name_encrypted FROM file_versions v
+		 JOIN files f ON f.id = v.file_id WHERE v.oss_key = ?
+		 LIMIT 1`,
+		ossKey, ossKey,
+	).Scan(&fileID, &name)
+	return fileID, name, err
 }
 
 func (d *Database) CreateFile(file *models.FileRecord) error {
@@ -505,6 +619,117 @@ func (d *Database) SoftDeleteFile(id string) error {
 		now, id,
 	)
 	return err
+}
+
+// ---- 回收站 ----
+
+type TrashItem struct {
+	ID            string    `json:"id"`
+	NameEncrypted string    `json:"name_encrypted"`
+	IsDirectory   bool      `json:"is_directory"`
+	FileSize      int64     `json:"file_size"`
+	ParentID      *string   `json:"parent_id"`
+	DeletedAt     time.Time `json:"deleted_at"`
+}
+
+// ListTrash 回收站列表：只列显式软删的行；被删文件夹的子项（未单独标记）不重复出现
+func (d *Database) ListTrash() ([]TrashItem, error) {
+	rows, err := d.conn.Query(
+		`SELECT id, name_encrypted, is_directory, file_size, parent_id, deleted_at
+		 FROM files WHERE deleted_at IS NOT NULL ORDER BY deleted_at DESC, id DESC`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]TrashItem, 0)
+	for rows.Next() {
+		var t TrashItem
+		if err := rows.Scan(&t.ID, &t.NameEncrypted, &t.IsDirectory, &t.FileSize,
+			&t.ParentID, &t.DeletedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// RestoreFile 恢复软删行：原父目录仍存在且未删除则回原位，否则回根目录。
+// 返回实际恢复到的 parent_id（nil = 根目录）。行不存在或未删除返回 sql.ErrNoRows。
+func (d *Database) RestoreFile(id string) (*string, error) {
+	var oldParent *string
+	var delAt any
+	err := d.conn.QueryRow(
+		"SELECT parent_id, deleted_at FROM files WHERE id = ? AND deleted_at IS NOT NULL",
+		id,
+	).Scan(&oldParent, &delAt)
+	if err != nil {
+		return nil, err
+	}
+
+	target := oldParent
+	if oldParent != nil {
+		var parentDel any
+		if err := d.conn.QueryRow("SELECT deleted_at FROM files WHERE id = ?", *oldParent).Scan(&parentDel); err != nil || parentDel != nil {
+			// 原目录已不存在或同样在回收站 → 恢复到根目录
+			target = nil
+		}
+	}
+
+	res, err := d.conn.Exec(
+		"UPDATE files SET deleted_at = NULL WHERE id = ? AND deleted_at IS NOT NULL", id,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return nil, sql.ErrNoRows
+	}
+	return target, nil
+}
+
+// purgeTrash 物理删除全部软删行及其后代（子项未标记 deleted_at 但随父消失）。
+// files 行形成树且禁止建环（MoveFile 防环），递归 CTE 不会无限展开。
+func (d *Database) purgeTrash(extraCond string, args ...any) (int64, error) {
+	q := `WITH RECURSIVE trash_tree(id) AS (
+		SELECT id FROM files WHERE deleted_at IS NOT NULL` + extraCond + `
+		UNION ALL
+		SELECT f.id FROM files f JOIN trash_tree t ON f.parent_id = t.id
+	) DELETE FROM files WHERE id IN (SELECT id FROM trash_tree)`
+	res, err := d.conn.Exec(q, args...)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// PurgeExpiredTrash 清理超过保留期的软删行（含后代）；days<=0 = 永不自动清理
+func (d *Database) PurgeExpiredTrash(days int) (int64, error) {
+	if days <= 0 {
+		return 0, nil
+	}
+	return d.purgeTrash(" AND deleted_at < datetime('now', ?)", fmt.Sprintf("-%d days", days))
+}
+
+// PurgeAllTrash 清空回收站：立即物理删除全部软删行及后代
+func (d *Database) PurgeAllTrash() (int64, error) {
+	return d.purgeTrash("")
+}
+
+// PurgeDeletedObjectsOlderThan 清理超过保留期的删除台账；days<=0 = 永不清理
+func (d *Database) PurgeDeletedObjectsOlderThan(days int) (int64, error) {
+	if days <= 0 {
+		return 0, nil
+	}
+	res, err := d.conn.Exec(
+		"DELETE FROM deleted_objects WHERE deleted_at < datetime('now', ?)",
+		fmt.Sprintf("-%d days", days),
+	)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 type DeletedObject struct {

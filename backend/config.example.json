@@ -31,5 +31,13 @@
     "max_backups": 10,
     "auto_backup_upload_oss": false,
     "on_file_change_upload_oss": false
+  },
+  "alert": {
+    "webhook_url": "",
+    "fail_threshold": 5,
+    "cooldown_seconds": 600
+  },
+  "trash": {
+    "retention_days": 30
   }
 }

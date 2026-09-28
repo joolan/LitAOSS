@@ -50,6 +50,9 @@ type Handler struct {
 	ledger         *OSSBackupLedger
 	lastBackupTime time.Time
 	backupMutex    sync.Mutex
+	// 登录失败告警冷却：ip → 上次发送时间（内存态，重启重置）
+	alertMu   sync.Mutex
+	alertLast map[string]time.Time
 }
 
 // NewHandler ledger 由调用方创建并在 scheduler 间共享（单一实例保证台账缓存一致）。
@@ -61,6 +64,15 @@ func NewHandler(database *db.Database, store storage.Storage, cfg *config.Config
 		sessions:      NewSessionStore(),
 		backupManager: NewBackupManager(cfg, store, database, ledger),
 		ledger:        ledger,
+		alertLast:     make(map[string]time.Time),
+	}
+}
+
+// audit 尽力记录操作审计（失败仅记日志、不影响业务）；文件名存密文保持零知识，
+// IP 经 SetTrustedProxies 后由 c.ClientIP 给出（只采信可信代理提交的转发头）。
+func (h *Handler) audit(c *gin.Context, action, targetType, targetID, targetName, detail string) {
+	if err := h.db.RecordAudit(action, targetType, targetID, targetName, detail, c.ClientIP()); err != nil {
+		log.Printf("audit record failed (%s): %v", action, err)
 	}
 }
 
@@ -166,6 +178,7 @@ func (h *Handler) Login(c *gin.Context) {
 	ok, err := h.db.VerifyPassword(req.AuthHash)
 	if err != nil || !ok {
 		h.db.RecordLoginAttempt(ip, false)
+		h.maybeAlertLoginFailure(ip)
 		c.JSON(http.StatusUnauthorized, models.LoginResponse{OK: false, Error: "invalid credentials"})
 		return
 	}
@@ -240,6 +253,28 @@ func (h *Handler) GetLoginHistory(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"attempts": attempts})
 }
 
+// ListAudit 操作审计分页列表：page（1 起）、page_size（默认 50、上限 200）、action 过滤
+func (h *Handler) ListAudit(c *gin.Context) {
+	page, _ := strconv.Atoi(c.Query("page"))
+	pageSize, _ := strconv.Atoi(c.Query("page_size"))
+	action := c.Query("action")
+	if action != "" {
+		switch action {
+		case "upload", "download", "delete", "rename", "move", "edit", "change_password",
+			"create_folder", "restore", "purge_trash":
+		default:
+			c.JSON(http.StatusBadRequest, models.MessageResponse{OK: false, Error: "invalid action"})
+			return
+		}
+	}
+	items, total, err := h.db.ListAudit(page, pageSize, action)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, models.MessageResponse{OK: false, Error: "failed to load audit log"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"items": items, "total": total})
+}
+
 func (h *Handler) UpdateKey(c *gin.Context) {
 	var req struct {
 		EncryptedAccountKey []byte `json:"encrypted_account_key" binding:"required"`
@@ -308,6 +343,8 @@ func (h *Handler) ChangePassword(c *gin.Context) {
 		return
 	}
 
+	h.audit(c, "change_password", "account", "", "", "")
+
 	// 改密码后注销所有会话（含其它设备/被盗会话），强制全部重新登录
 	h.sessions.DeleteAll()
 
@@ -371,6 +408,7 @@ func (h *Handler) CreateFolder(c *gin.Context) {
 		return
 	}
 
+	h.audit(c, "create_folder", "folder", file.ID, req.NameEncrypted, "")
 	c.JSON(http.StatusOK, file)
 }
 
@@ -407,6 +445,7 @@ func (h *Handler) CreateFileRecord(c *gin.Context) {
 		return
 	}
 
+	h.audit(c, "upload", "file", file.ID, req.NameEncrypted, strconv.FormatInt(req.FileSize, 10))
 	h.triggerBackup()
 	c.JSON(http.StatusOK, file)
 }
@@ -432,6 +471,9 @@ func (h *Handler) UpdateFileContent(c *gin.Context) {
 		return
 	}
 
+	if f, err := h.db.GetFile(id); err == nil {
+		h.audit(c, "edit", "file", id, f.NameEncrypted, "")
+	}
 	h.triggerBackup()
 	c.JSON(http.StatusOK, models.MessageResponse{OK: true})
 }
@@ -506,6 +548,15 @@ func (h *Handler) PresignDownload(c *gin.Context) {
 		return
 	}
 
+	// 仅显式声明 purpose=download 的请求计入下载审计（预览/编辑器加载不传）
+	if req.Purpose == "download" {
+		fid, name, err := h.db.FindFileNameByOSSKey(req.OSSKey)
+		if err != nil {
+			fid, name = "", ""
+		}
+		h.audit(c, "download", "file", fid, name, "")
+	}
+
 	c.JSON(http.StatusOK, models.PresignResponse{URL: url})
 }
 
@@ -557,6 +608,7 @@ func (h *Handler) DeleteFile(c *gin.Context) {
 		return
 	}
 
+	h.audit(c, "delete", "file", req.ID, file.NameEncrypted, "单个删除")
 	h.triggerBackup()
 	c.JSON(http.StatusOK, models.MessageResponse{OK: true})
 }
@@ -571,11 +623,18 @@ func (h *Handler) RenameFile(c *gin.Context) {
 		return
 	}
 
+	oldName := ""
+	if f, err := h.db.GetFile(req.ID); err == nil {
+		oldName = f.NameEncrypted
+	}
+
 	if err := h.db.UpdateFile(req.ID, req.NameEncrypted); err != nil {
 		c.JSON(http.StatusInternalServerError, models.MessageResponse{OK: false, Error: err.Error()})
 		return
 	}
 
+	// detail 存改名前的密文名，前端会话内解密展示「旧名 → 新名」
+	h.audit(c, "rename", "file", req.ID, req.NameEncrypted, oldName)
 	h.triggerBackup()
 	c.JSON(http.StatusOK, models.MessageResponse{OK: true})
 }
@@ -683,6 +742,7 @@ func (h *Handler) MoveFile(c *gin.Context) {
 		return
 	}
 
+	destName := "" // 空 = 移动到根目录
 	if req.ParentID != nil {
 		if *req.ParentID == id {
 			c.JSON(http.StatusBadRequest, models.MessageResponse{OK: false, Error: "不能移动到自身"})
@@ -697,6 +757,7 @@ func (h *Handler) MoveFile(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, models.MessageResponse{OK: false, Error: "目标不是文件夹"})
 			return
 		}
+		destName = parent.NameEncrypted
 		if file.IsDirectory {
 			for cur, depth := parent, 0; cur != nil && depth < 256; depth++ {
 				if cur.ID == id {
@@ -720,6 +781,8 @@ func (h *Handler) MoveFile(c *gin.Context) {
 		return
 	}
 
+	// detail 存目标目录密文名（空 = 根目录），前端解密展示
+	h.audit(c, "move", "file", id, file.NameEncrypted, destName)
 	h.triggerBackup()
 	c.JSON(http.StatusOK, models.MessageResponse{OK: true})
 }
@@ -741,6 +804,7 @@ func (h *Handler) BatchDelete(c *gin.Context) {
 		file, err := h.db.GetFile(id)
 		if err == nil {
 			h.recordFileDeletion(file, "批量删除")
+			h.audit(c, "delete", "file", id, file.NameEncrypted, "批量删除")
 		}
 		h.db.SoftDeleteFile(id)
 	}
@@ -760,6 +824,60 @@ func (h *Handler) GetDeletedObjects(c *gin.Context) {
 		objects = []db.DeletedObject{}
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true, "deleted_objects": objects})
+}
+
+// ListTrash 回收站列表；retention_days=0 表示从不自动清理
+func (h *Handler) ListTrash(c *gin.Context) {
+	items, err := h.db.ListTrash()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, models.MessageResponse{OK: false, Error: err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"items":          items,
+		"retention_days": h.config.Trash.RetentionDays,
+	})
+}
+
+// RestoreFile 恢复回收站条目到原位置（原目录已删则回根目录）
+func (h *Handler) RestoreFile(c *gin.Context) {
+	id := c.Param("id")
+	target, err := h.db.RestoreFile(id)
+	if errors.Is(err, sql.ErrNoRows) {
+		c.JSON(http.StatusNotFound, models.MessageResponse{OK: false, Error: "not in trash"})
+		return
+	}
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, models.MessageResponse{OK: false, Error: err.Error()})
+		return
+	}
+
+	name := ""
+	if f, gerr := h.db.GetFile(id); gerr == nil {
+		name = f.NameEncrypted
+	}
+	detail := ""
+	if target == nil {
+		detail = "原目录已删除，恢复到根目录"
+	}
+	h.audit(c, "restore", "file", id, name, detail)
+	h.triggerBackup()
+	c.JSON(http.StatusOK, gin.H{"ok": true, "parent_id": target})
+}
+
+// PurgeTrash 清空回收站（立即物理删除，不可撤销）——与删除同受 MFA 二次验证保护
+func (h *Handler) PurgeTrash(c *gin.Context) {
+	if !h.requireDeleteMFA(c) {
+		return
+	}
+	n, err := h.db.PurgeAllTrash()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, models.MessageResponse{OK: false, Error: err.Error()})
+		return
+	}
+	h.audit(c, "purge_trash", "trash", "", "", strconv.FormatInt(n, 10))
+	h.triggerBackup()
+	c.JSON(http.StatusOK, gin.H{"ok": true, "purged": n})
 }
 
 func (h *Handler) GetStorageStats(c *gin.Context) {

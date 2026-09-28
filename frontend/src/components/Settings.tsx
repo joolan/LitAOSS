@@ -1,17 +1,19 @@
 import { useState, lazy, Suspense } from 'react';
-import { Settings as SettingsIcon, Key, Lock, Eye, EyeOff, Check, AlertCircle, Copy, Shield, RefreshCw, Wrench, Database, History, BarChart3 } from 'lucide-react';
+import { Settings as SettingsIcon, Key, Lock, Eye, EyeOff, Check, AlertCircle, Copy, Shield, RefreshCw, Wrench, Database, History, BarChart3, ScrollText } from 'lucide-react';
 import { api, getServerVersion } from '../api/client';
 import ChangePassword from './ChangePassword';
 import MFASetup from './MFASetup';
 import FileEncryptTool from './FileEncryptTool';
 import BackupSettings from './BackupSettings';
 import LoginHistory from './LoginHistory';
+import AuditLog from './AuditLog';
+import OfflineCacheSettings from './OfflineCacheSettings';
 
 interface SettingsProps {
   onClose: () => void;
 }
 
-type Tab = 'encrypt-tool' | 'encrypt' | 'password' | 'mfa' | 'backup' | 'history' | 'stats';
+type Tab = 'encrypt-tool' | 'encrypt' | 'password' | 'mfa' | 'backup' | 'history' | 'audit' | 'cache' | 'stats';
 type EncryptSubTab = 'encrypt' | 'decrypt';
 
 const StatsCharts = lazy(() => import('./StatsCharts'));
@@ -146,6 +148,24 @@ export default function Settings({ onClose }: SettingsProps) {
           >
             <History className="w-4 h-4 inline mr-1" />
             登录历史
+          </button>
+          <button
+            onClick={() => setTab('audit')}
+            className={`flex-auto px-3 py-3 text-sm font-medium whitespace-nowrap transition-colors ${
+              tab === 'audit' ? 'text-emerald-400 border-b-2 border-emerald-400' : 'text-gray-400 hover:text-white'
+            }`}
+          >
+            <ScrollText className="w-4 h-4 inline mr-1" />
+            操作审计
+          </button>
+          <button
+            onClick={() => setTab('cache')}
+            className={`flex-auto px-3 py-3 text-sm font-medium whitespace-nowrap transition-colors ${
+              tab === 'cache' ? 'text-emerald-400 border-b-2 border-emerald-400' : 'text-gray-400 hover:text-white'
+            }`}
+          >
+            <Database className="w-4 h-4 inline mr-1" />
+            缓存
           </button>
           <button
             onClick={() => setTab('stats')}
@@ -322,6 +342,8 @@ export default function Settings({ onClose }: SettingsProps) {
           {tab === 'password' && <ChangePassword onClose={onClose} />}
           {tab === 'mfa' && <MFASetup onClose={onClose} />}
           {tab === 'history' && <LoginHistory />}
+          {tab === 'audit' && <AuditLog />}
+          {tab === 'cache' && <OfflineCacheSettings />}
           {tab === 'stats' && (
             <Suspense fallback={<div className="text-gray-400 text-sm py-8 text-center">加载统计…</div>}>
               <StatsCharts />

@@ -67,7 +67,7 @@ export default function VersionHistory({ file, fileName, onClose, onChanged }: V
     setBusy(true);
     setError('');
     try {
-      const presignRes = await api.getPresignDownloadUrl(v.oss_key);
+      const presignRes = await api.getPresignDownloadUrl(v.oss_key, 3600, 'download');
       const response = await fetch(presignRes.url);
       const ciphertext = await response.arrayBuffer();
       const plaintext = await decryptBytes(ciphertext, v);

@@ -21,6 +21,23 @@ type Config struct {
 	OSS      OSSConfig      `json:"oss"`
 	Auth     AuthConfig     `json:"auth"`
 	Backup   BackupConfig   `json:"backup"`
+	Alert    AlertConfig    `json:"alert"`
+	Trash    TrashConfig    `json:"trash"`
+}
+
+// AlertConfig 登录失败告警：webhook_url 为空则功能关闭。
+// 同一 IP 在锁定窗口内失败次数达到 fail_threshold 时向 webhook POST JSON，
+// 冷却期内同一 IP 不重复发送。
+type AlertConfig struct {
+	WebhookURL      string `json:"webhook_url"`
+	FailThreshold   int    `json:"fail_threshold"`   // <=0 取 5
+	CooldownSeconds int    `json:"cooldown_seconds"` // <=0 取 600
+}
+
+// TrashConfig 回收站保留策略。RetentionDays：软删数据自动物理清理的保留天数，
+// 0 = 永不自动清理（防误删优先时可设 0）。
+type TrashConfig struct {
+	RetentionDays int `json:"retention_days"`
 }
 
 type ServerConfig struct {
@@ -91,6 +108,13 @@ func DefaultConfig() *Config {
 			OnFileChange:   false,
 			MinIntervalSec: 300,
 			MaxBackups:     10,
+		},
+		Alert: AlertConfig{
+			FailThreshold:   5,
+			CooldownSeconds: 600,
+		},
+		Trash: TrashConfig{
+			RetentionDays: 30,
 		},
 	}
 }

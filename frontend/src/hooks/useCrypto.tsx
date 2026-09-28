@@ -190,7 +190,7 @@ export function CryptoProvider({ children }: { children: ReactNode }) {
   const downloadAndDecrypt = useCallback(async (file: FileRecord): Promise<Blob> => {
     if (!state.accountKey) throw new Error('not unlocked');
 
-    const presignRes = await api.getPresignDownloadUrl(file.oss_key);
+    const presignRes = await api.getPresignDownloadUrl(file.oss_key, 3600, 'download');
     const response = await fetch(presignRes.url);
     const ciphertext = await response.arrayBuffer();
 

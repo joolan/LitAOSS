@@ -41,6 +41,19 @@ type LoginAttempt struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+// AuditEntry 操作审计：target_name 存文件密文名（前端会话内解密，保持零知识），
+// detail 按动作存补充信息（改名前的旧密文名 / 移动目标目录密文名 / 上传字节数）
+type AuditEntry struct {
+	ID         int64     `json:"id"`
+	Action     string    `json:"action"`
+	TargetType string    `json:"target_type"`
+	TargetID   string    `json:"target_id"`
+	TargetName string    `json:"target_name"`
+	Detail     string    `json:"detail"`
+	IPAddress  string    `json:"ip_address"`
+	CreatedAt  time.Time `json:"created_at"`
+}
+
 type LoginRequest struct {
 	AuthHash string `json:"auth_hash" binding:"required"`
 	Salt     string `json:"salt" binding:"required"`
@@ -86,6 +99,8 @@ type FileUploadRequest struct {
 type PresignRequest struct {
 	OSSKey  string `json:"oss_key" binding:"required"`
 	Expires int    `json:"expires"`
+	// purpose 仅 "download" 记录操作审计；预览/编辑器加载不传（不计入下载计量）
+	Purpose string `json:"purpose"`
 }
 
 type PresignResponse struct {

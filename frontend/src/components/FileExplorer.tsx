@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback } from 'react';
+import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import {
   Upload, FolderPlus, Trash2, Download, Eye, Edit3, File, Image,
   ChevronRight, Home, MoreVertical, X, Save, Check, HardDrive, Folder,
@@ -22,15 +22,25 @@ import FilePreview from './FilePreview';
 import TextEditor from './TextEditor';
 import VersionHistory from './VersionHistory';
 import Settings from './Settings';
+import TrashDialog from './TrashDialog';
 import UploadQueueDialog from './UploadQueueDialog';
 import FolderPicker from './FolderPicker';
 import { getCachedSnapshot, putCachedSnapshot, invalidateListCache } from '../fileListCache';
+import { useVirtualWindow } from '../useVirtualWindow';
 
 interface FileExplorerProps {
   onLock: () => void;
 }
 
 type ViewMode = 'grid' | 'list';
+
+// 超过该数量的目录启用窗口化渲染（只渲染可视区附近，其余占位撑高）
+const VIRT_THRESHOLD = 200;
+// 列表行高（px，虚拟化时显式固定）：py-3*2 + 文本行 20 + 下边框 1 ≈ 46
+const LIST_ROW_H = 46;
+// 网格行步长：卡片 132 + gap 12
+const GRID_ROW_H = 132;
+const GRID_ROW_STRIDE = GRID_ROW_H + 12;
 
 export default function FileExplorer({ onLock }: FileExplorerProps) {
   const [files, setFiles] = useState<FileRecord[]>([]);
@@ -53,6 +63,7 @@ export default function FileExplorer({ onLock }: FileExplorerProps) {
   const [newTextFileName, setNewTextFileName] = useState('');
   const [showNewTextFile, setShowNewTextFile] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [showTrash, setShowTrash] = useState(false);
   const [showLockConfirm, setShowLockConfirm] = useState(false);
   const [emptyMenu, setEmptyMenu] = useState<{ x: number; y: number } | null>(null);
   const [selectMode, setSelectMode] = useState(false);
@@ -75,6 +86,35 @@ export default function FileExplorer({ onLock }: FileExplorerProps) {
   const renameInputRef = useRef<HTMLInputElement>(null);
   const dragDepthRef = useRef(0);
   const loadSeqRef = useRef(0);
+  const gridRef = useRef<HTMLDivElement>(null);
+  const tbodyRef = useRef<HTMLTableSectionElement>(null);
+  // Tailwind 断点 = 视口宽度：sm:640 / md:768 / lg:1024
+  const [gridCols, setGridCols] = useState(6);
+
+  useEffect(() => {
+    const onResize = () => {
+      const w = window.innerWidth;
+      setGridCols(w < 640 ? 2 : w < 768 ? 3 : w < 1024 ? 4 : 6);
+    };
+    onResize();
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
+
+  const virtEnabled = files.length >= VIRT_THRESHOLD;
+  const rowCount = Math.ceil(files.length / gridCols);
+  const gridVW = useVirtualWindow(gridRef, rowCount, GRID_ROW_STRIDE, viewMode === 'grid' && virtEnabled);
+  const listVW = useVirtualWindow(tbodyRef, files.length, LIST_ROW_H, viewMode === 'list' && virtEnabled);
+
+  // 实际渲染的条目：虚拟化时只取可视窗口内（按整行对齐），否则全量
+  const displayFiles = useMemo(() => {
+    if (viewMode === 'grid') {
+      if (!gridVW.active) return files;
+      return files.slice(gridVW.startUnit * gridCols, gridVW.endUnit * gridCols);
+    }
+    if (!listVW.active) return files;
+    return files.slice(listVW.startUnit, listVW.endUnit);
+  }, [files, viewMode, gridCols, gridVW, listVW]);
 
   const decryptName = useCallback(async (encryptedName: string): Promise<string> => {
     if (!getSessionPassword()) return '(未解锁)';
@@ -131,32 +171,48 @@ export default function FileExplorer({ onLock }: FileExplorerProps) {
     loadFiles(currentFolder);
   }, [currentFolder, loadFiles]);
 
-  // 网格缩略图：只读「预览时已生成」的缓存，不为展示解密图片
+  // 网格缩略图：只读「预览时已生成」的缓存，不为展示解密图片。
+  // 虚拟化时只查可视窗口；URL 缓存常驻，滚动只增量补齐，不整体重建。
   const thumbUrlsRef = useRef<Map<string, string>>(new Map());
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      const imageFiles = files.filter(
+      // 目录切换后清理已离开列表的条目
+      const liveIds = new Set(files.map((f) => f.id));
+      for (const [id, url] of thumbUrlsRef.current) {
+        if (!liveIds.has(id)) {
+          URL.revokeObjectURL(url);
+          thumbUrlsRef.current.delete(id);
+        }
+      }
+      const imageFiles = displayFiles.filter(
         (f) => !f.is_directory && getPreviewMode(decryptedNames.get(f.id) || '') === 'image',
       );
-      const next = new Map<string, string>();
+      const next = new Map(thumbUrlsRef.current);
+      const created: string[] = [];
+      let changed = false;
       for (const f of imageFiles) {
+        if (next.has(f.id)) continue;
         const blob = await getThumb(thumbKey(f));
         if (cancelled) {
-          for (const u of next.values()) URL.revokeObjectURL(u);
+          for (const u of created) URL.revokeObjectURL(u);
           return;
         }
-        if (blob) next.set(f.id, URL.createObjectURL(blob));
+        if (blob) {
+          const url = URL.createObjectURL(blob);
+          created.push(url);
+          next.set(f.id, url);
+          changed = true;
+        }
       }
-      if (cancelled) return;
-      for (const u of thumbUrlsRef.current.values()) URL.revokeObjectURL(u);
+      if (cancelled || !changed) return;
       thumbUrlsRef.current = next;
       setThumbs(next);
     })();
     return () => {
       cancelled = true;
     };
-  }, [files, decryptedNames, thumbsRev]);
+  }, [displayFiles, files, decryptedNames, thumbsRev]);
 
   useEffect(
     () => () => {
@@ -604,7 +660,7 @@ export default function FileExplorer({ onLock }: FileExplorerProps) {
   };
 
   const downloadAndDecryptFile = async (file: FileRecord): Promise<Blob> => {
-    const presignRes = await api.getPresignDownloadUrl(file.oss_key);
+    const presignRes = await api.getPresignDownloadUrl(file.oss_key, 3600, 'download');
     const response = await fetch(presignRes.url);
     const ciphertext = await response.arrayBuffer();
 
@@ -791,6 +847,14 @@ export default function FileExplorer({ onLock }: FileExplorerProps) {
               <span className="hidden sm:inline">新建文档</span>
             </button>
             <button
+              onClick={() => setShowTrash(true)}
+              className="inline-flex items-center gap-2 px-4 py-2 bg-gray-800 hover:bg-gray-700 rounded-lg transition-colors text-sm"
+              title="回收站（恢复已删除内容）"
+            >
+              <Trash2 className="w-4 h-4" />
+              <span className="hidden sm:inline">回收站</span>
+            </button>
+            <button
               onClick={() => (selectMode ? exitSelectMode() : setSelectMode(true))}
               className={`inline-flex items-center gap-2 px-4 py-2 rounded-lg transition-colors text-sm ${
                 selectMode
@@ -960,10 +1024,19 @@ export default function FileExplorer({ onLock }: FileExplorerProps) {
             <p>空空如也，上传一些文件吧</p>
           </div>
         ) : viewMode === 'grid' ? (
-          <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-3">
-            {files.map((file) => (
+          <div
+            ref={gridRef}
+            className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-3"
+            style={
+              gridVW.active
+                ? { paddingTop: gridVW.padTop, paddingBottom: gridVW.padBottom }
+                : undefined
+            }
+          >
+            {displayFiles.map((file) => (
               <div
                 key={file.id}
+                style={virtEnabled ? { height: GRID_ROW_H } : undefined}
                 className={`group p-4 bg-gray-900 rounded-xl hover:bg-gray-800 transition-colors cursor-pointer relative ${
                   selectMode && selected.has(file.id)
                     ? 'ring-2 ring-emerald-500 bg-emerald-500/10'
@@ -1063,10 +1136,19 @@ export default function FileExplorer({ onLock }: FileExplorerProps) {
                   <th className="px-4 py-3 font-medium w-24">操作</th>
                 </tr>
               </thead>
-              <tbody>
-                {files.map((file) => (
+              <tbody ref={tbodyRef}>
+                {listVW.active && listVW.padTop > 0 && (
+                  <tr aria-hidden>
+                    <td
+                      colSpan={selectMode ? 5 : 4}
+                      style={{ height: listVW.padTop, padding: 0, border: 0 }}
+                    />
+                  </tr>
+                )}
+                {displayFiles.map((file) => (
                   <tr
                     key={file.id}
+                    style={virtEnabled ? { height: LIST_ROW_H } : undefined}
                     className={`border-b border-gray-800/50 hover:bg-gray-800/50 cursor-pointer ${
                       selectMode && selected.has(file.id) ? 'bg-emerald-500/10' : ''
                     }`}
@@ -1158,6 +1240,14 @@ export default function FileExplorer({ onLock }: FileExplorerProps) {
                     </td>
                   </tr>
                 ))}
+                {listVW.active && listVW.padBottom > 0 && (
+                  <tr aria-hidden>
+                    <td
+                      colSpan={selectMode ? 5 : 4}
+                      style={{ height: listVW.padBottom, padding: 0, border: 0 }}
+                    />
+                  </tr>
+                )}
               </tbody>
             </table>
           </div>
@@ -1328,6 +1418,13 @@ export default function FileExplorer({ onLock }: FileExplorerProps) {
       )}
 
       {showSettings && <Settings onClose={() => setShowSettings(false)} />}
+
+      {showTrash && (
+        <TrashDialog
+          onClose={() => setShowTrash(false)}
+          onChanged={() => loadFiles(currentFolder, true)}
+        />
+      )}
 
       {mfaDelete && (
         <div className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4">

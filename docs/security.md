@@ -271,7 +271,10 @@ CSP 双重生效路径:
 启用 TOTP 后，以下高危操作额外要求 TOTP 验证:
 
 - 删除文件: `DELETE /api/files/:id`、`POST /api/files/batch-delete`
+- 清空回收站: `POST /api/trash/purge`（立即物理删除、不可恢复，与删除共用同一 MFA 标记）
 - 恢复数据库备份: `POST /api/backup/restore`（恢复会覆盖 `mfa`/`sessions` 等敏感表，同样走 `requireDeleteMFA`）
+
+恢复类操作 (`POST /api/trash/:id/restore`) **不**要求 MFA——它把数据放回可见位置，不是破坏性操作。
 
 验证流程:
 
@@ -279,7 +282,7 @@ CSP 双重生效路径:
 - 验证通过后该 Session 标记 `DeleteMFAVerified`，**同一 Session 后续高危操作不再校验**
 - Session 登出/过期/后端重启后失效，需重新验证
 - 验证失败计入与登录 TOTP 相同的限流计数 (5 次 / 15 分钟锁定)
-- 未验证时接口返回 `403 { "mfa_required": true }`，前端弹出验证码输入框，验证成功后自动重试（文件删除在 `FileExplorer`，备份恢复在 `BackupSettings`）
+- 未验证时接口返回 `403 { "mfa_required": true }`，前端弹出验证码输入框，验证成功后自动重试（文件删除在 `FileExplorer`，备份恢复在 `BackupSettings`，清空回收站在 `TrashDialog`）
 
 ---
 
@@ -436,7 +439,8 @@ config.json 中的 SecretKey 可以加密存储：
 
 ### 10.4 监控
 
-- 监控登录失败次数
+- 监控登录失败次数；同 IP 在锁定窗口内失败达 `alert.fail_threshold`（默认 5）时向 `alert.webhook_url` 异步推送告警（5s 超时，同 IP 默认 600s 冷却，URL 留空关闭）
+- 操作审计 (`audit_log`) 全量留痕上传/下载/删除/改名/移动/编辑/改密/新建/恢复/清空回收站（时间、动作、密文名、详情、IP），`GET /api/audit` 分页查询，保留 180 天
 - 监控异常 API 请求
 - 监控 OSS 流量异常
 
@@ -525,6 +529,7 @@ config.json 中的 SecretKey 可以加密存储：
 
 - 运行时 SQLite 数据库为明文，停止服务后才加密 (`.db.enc`)；且解密口令常与数据同目录 → 加密仅防"拷走文件离线分析"，不防"入侵正在运行的服务器"
 - 本地备份快照 (`data/backups/`) 为明文 SQLite，处置等级等同密钥库；上传到 OSS 的备份副本为 AES-256-GCM 加密态（见 §10.3），泄露仅得密文
+- 浏览器端离线预览缓存 (IndexedDB) 只存**密文副本**（与 OSS 相同字节），解密仍需解锁态会话内的包装密钥；7 天 TTL，且锁定/登出/刷新/重新登录即清空（`App` 统一触发），设置页可查占用并手动清除
 
 ### 12.7 单用户 + 内存会话
 
@@ -534,6 +539,8 @@ config.json 中的 SecretKey 可以加密存储：
 ### 12.8 OSS 对象只增不减 (软删除)
 
 - 为撤销 `oss:DeleteObject` 权限，删除均为软删除: 对象保留在 OSS，`deleted_objects` 台账登记 (文件名密文、oss_key、大小、原因、时间)，`GET /api/deleted-objects` 可查询
+- 软删行进入**回收站** (`GET /api/trash`)，默认保留 30 天内可恢复 (`POST /api/trash/:id/restore`，原父目录已删则回根目录)；超期由每日后台任务连同后代一并物理删除数据库行（`trash.retention_days=0` 可关闭自动清理），「清空回收站」为立即物理删除、走删除 MFA
+- 数据库行的物理清理**不影响 OSS 对象**——对象仍按台账保留；`deleted_objects` 台账行保留 90 天、`audit_log` 保留 180 天后清理
 - 后果: 存储只增不减；清理需在 OSS 控制台按台账手动删除对象 (或临时恢复 DeleteObject 权限)
 - **不可用 OSS 生命周期规则替代**: 规则按前缀/时间一刀切，无法区分存活对象与软删对象，会误删在用文件
 - 已知孤儿: 上传 PUT 成功但 `createFileRecord` 失败的对象无任何记录，无法通过台账发现 (概率极低，既有问题)

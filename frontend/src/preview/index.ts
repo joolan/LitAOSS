@@ -15,4 +15,5 @@ registerPreview(pptxModule);
 export { resolvePreview, registerPreview, PREVIEW_MAX_SIZE } from './registry';
 export { decryptFileContent } from './decryptFile';
 export { thumbKey, generateThumb, getThumb, putThumb, clearThumbCache } from './thumbCache';
+export { clearOfflineCache, offlineCacheUsage } from './offlineCache';
 export type { PreviewModule, PreviewRenderProps, PreviewKind } from './types';

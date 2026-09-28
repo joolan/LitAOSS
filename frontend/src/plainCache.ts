@@ -97,7 +97,7 @@ export function prefetchPlain(file: FileRecord): Promise<PlainEntry> | undefined
   const gen = generation;
   const p = (async () => {
     try {
-      const content = await decryptFileContent(file);
+      const content = await decryptFileContent(file, 'download');
       const blob = new Blob([content], {
         type: file.file_type || 'application/octet-stream',
       });

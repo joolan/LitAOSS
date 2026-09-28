@@ -559,6 +559,91 @@ pending 会话流转与失败锁定；恢复码**一次性消费**，用过即�
 
 `is_version: true` 表示该文件的历史版本对象；`reason` 取值: `单个删除` / `批量删除` (后端固定，不可自定义)。
 
+### GET /api/audit
+
+操作审计分页列表 (按 id 倒序)。记录 `upload` / `download`(仅 purpose=download) / `delete` / `rename` / `move` / `edit` / `change_password` / `create_folder` / `restore` / `purge_trash`；文件名为密文 (前端会话内解密，零知识不变)，IP 为可信代理口径下的客户端 IP。审计失败仅记日志、不影响业务。
+
+**权限:** 需有效会话 + MFA
+
+**查询参数:**
+- `page` (可选) — 页码，1 起，默认 1
+- `page_size` (可选) — 每页条数，默认 50，上限 200
+- `action` (可选) — 按动作过滤，非法取值返回 400
+
+**响应:**
+```json
+{
+  "ok": true,
+  "items": [
+    {
+      "id": 1,
+      "action": "delete",
+      "target_type": "file",
+      "target_id": "文件 UUID",
+      "name_encrypted": "Iv+密文 base64",
+      "detail": "单个删除",
+      "ip_address": "1.2.3.4",
+      "created_at": "2026-09-28T12:00:00Z"
+    }
+  ],
+  "total": 123
+}
+```
+
+`rename` 的 `detail` 存旧文件密文名；`move` 的 `detail` 存目标目录密文名 (空 = 根目录)；`upload` 的 `detail` 存字节数。
+
+### GET /api/trash
+
+回收站列表: 仅含显式软删 (`deleted_at IS NOT NULL`) 的行，被删文件夹的子项不重复出现。文件名为密文。
+
+**权限:** 需有效会话 + MFA
+
+**响应:**
+```json
+{
+  "ok": true,
+  "items": [
+    {
+      "id": "文件 UUID",
+      "name_encrypted": "Iv+密文 base64",
+      "is_directory": false,
+      "file_size": 102400,
+      "parent_id": "原父目录 UUID 或 null",
+      "deleted_at": "2026-09-28T12:00:00Z"
+    }
+  ],
+  "retention_days": 30
+}
+```
+
+`retention_days` 为 0 表示从不自动清理 (配置 `trash.retention_days`)。
+
+### POST /api/trash/:id/restore
+
+恢复软删条目。原父目录仍存在且未删除则回原位，否则回根目录。**不需要删除 MFA** (恢复为反破坏操作)。恢复动作写入审计 (`restore`)。
+
+**权限:** 需有效会话 + MFA
+
+**响应:**
+```json
+{ "ok": true, "parent_id": "恢复到的父目录 UUID，null 表示根目录" }
+```
+
+条目不在回收站时返回 404。
+
+### POST /api/trash/purge
+
+清空回收站: 立即物理删除全部软删行及其后代，**不可恢复**。与删除同受 MFA 二次验证保护 (`verify-totp-delete`，同一会话仅首次需要)。写入审计 (`purge_trash`)。
+
+**权限:** 需有效会话 + 删除 MFA
+
+**响应:**
+```json
+{ "ok": true, "purged": 12 }
+```
+
+超过 `trash.retention_days` 的条目由后台任务每日自动物理清理 (启动时补跑)；台账 `deleted_objects` 保留 90 天、审计 `audit_log` 保留 180 天后清理。
+
 ---
 
 ## 4. 文件夹
@@ -610,11 +695,13 @@ pending 会话流转与失败锁定；恢复码**一次性消费**，用过即�
 ```json
 {
   "oss_key": "files/uuid/random.enc",
-  "expires": 3600
+  "expires": 3600,
+  "purpose": "download"
 }
 ```
 
 - `expires` (可选) — 签名有效期，单位秒，**默认 3600（1 小时）**；过期后 GET 返回 403
+- `purpose` (可选) — 仅 `"download"` (拖出下载) 时后端记入下载审计并反查文件名；预览/编辑器加载不传，不计入下载计量
 
 **响应:**
 ```json

@@ -266,6 +266,21 @@ CREATE TABLE deleted_objects (
     deleted_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
+-- 操作审计 (上传/下载/删除/改名/移动/编辑/改密/新建/恢复/清空回收站)
+CREATE TABLE audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    action TEXT NOT NULL,              -- upload / download / delete / rename / move / edit /
+                                       -- change_password / create_folder / restore / purge_trash
+    target_type TEXT NOT NULL DEFAULT '',
+    target_id TEXT NOT NULL DEFAULT '',
+    target_name TEXT NOT NULL DEFAULT '',   -- 文件名密文 (前端会话内解密，零知识)
+    detail TEXT NOT NULL DEFAULT '',        -- rename=旧名密文 / move=目标目录密文 / delete=单个或批量
+    ip_address TEXT NOT NULL DEFAULT '',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+-- 索引: idx_audit_created(created_at), idx_audit_action(action)
+-- 回收站 = files.deleted_at 非空的行 (无独立表)；保留期超期由每日任务物理删除
+
 -- OSS 加密备份上传台账不在数据库里: 见 data/backups/oss-ledger.json。
 -- 原因: ① 台账写入会改变备份内容，MD5 跳过将永远失效；
 --       ② 恢复旧数据库快照会把台账回滚，较新的 OSS 对象将从恢复白名单消失。
@@ -316,6 +331,10 @@ db-backups/{lit-aoss_<ts>}.db.enc
 | DELETE | /api/files/:id | 软删除文件 (写 deleted_objects 台账，不删 OSS 对象) |
 | POST | /api/files/batch-delete | 批量删除 (同上) |
 | GET | /api/deleted-objects | 查询软删除台账 |
+| GET | /api/audit | 操作审计分页查询 (按 action 过滤，文件名密文) |
+| GET | /api/trash | 回收站列表 (仅显式软删行 + 保留天数) |
+| POST | /api/trash/:id/restore | 恢复 (原位或回根目录，无需删除 MFA) |
+| POST | /api/trash/purge | 清空回收站 (立即物理删除，需删除 MFA) |
 
 ### 5.3 存储操作
 
@@ -369,9 +388,10 @@ LitAOSS/
 │   ├── cmd/server/main.go                # 程序入口
 │   ├── internal/
 │   │   ├── api/
-│   │   │   ├── handlers.go               # HTTP 路由与处理器
+│   │   │   ├── handlers.go               # HTTP 路由与处理器（含审计/回收站）
 │   │   │   ├── session.go                # 会话存储
 │   │   │   ├── mfa.go                    # TOTP/MFA 逻辑
+│   │   │   ├── alert.go                  # 登录失败 webhook 告警（阈值+冷却）
 │   │   │   ├── backup.go                 # 备份管理与恢复
 │   │   │   └── ossledger.go              # OSS 备份上传台账 (文件, 不入库)
 │   │   ├── config/
@@ -399,7 +419,10 @@ LitAOSS/
 │   │   ├── preview/
 │   │   │   ├── registry.ts               # 预览模块注册表（扩展入口）
 │   │   │   ├── modules/                  # 各格式模块描述 (pdf/docx/xlsx/pptx)
-│   │   │   └── viewers/                  # 懒加载查看器组件
+│   │   │   ├── viewers/                  # 懒加载查看器组件
+│   │   │   ├── thumbCache.ts             # 图片缩略图缓存 (IndexedDB, 解锁态外清空)
+│   │   │   └── offlineCache.ts           # 离线预览密文缓存 (IndexedDB, 7 天 TTL)
+│   │   ├── useVirtualWindow.ts           # 目录窗口化渲染 hook（大目录虚拟滚动）
 │   │   ├── api/
 │   │   │   └── client.ts                 # API 客户端
 │   │   ├── hooks/
@@ -414,7 +437,10 @@ LitAOSS/
 │   │   │   ├── FolderPicker.tsx          # 移动目标文件夹选择器（批量移动）
 │   │   │   ├── FilePreview.tsx           # 文件预览
 │   │   │   ├── TextEditor.tsx            # 文本编辑器
-│   │   │   ├── Settings.tsx              # 设置弹窗（加密工具/密钥/密码/MFA/备份/登录历史）
+│   │   │   ├── Settings.tsx              # 设置弹窗（加密工具/密钥/密码/MFA/备份/登录历史/审计/缓存/统计）
+│   │   │   ├── AuditLog.tsx              # 操作审计页（分页/动作筛选/密文名解密）
+│   │   │   ├── TrashDialog.tsx           # 回收站（倒计时/恢复/输入确认清空+MFA）
+│   │   │   ├── OfflineCacheSettings.tsx  # 离线预览缓存占用与手动清除
 │   │   │   └── LoginHistory.tsx          # 最近登录尝试列表（成功/失败/IP）
 │   │   ├── App.tsx                       # 主应用
 │   │   ├── main.tsx                      # 入口
