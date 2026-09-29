@@ -25,7 +25,7 @@ import Settings from './Settings';
 import TrashDialog from './TrashDialog';
 import UploadQueueDialog from './UploadQueueDialog';
 import FolderPicker from './FolderPicker';
-import { getCachedSnapshot, putCachedSnapshot, invalidateListCache } from '../fileListCache';
+import { getCachedSnapshot, putCachedSnapshot, invalidateListCache, invalidateFolderSnapshot } from '../fileListCache';
 import { useVirtualWindow } from '../useVirtualWindow';
 
 interface FileExplorerProps {
@@ -69,6 +69,8 @@ export default function FileExplorer({ onLock }: FileExplorerProps) {
   const [selectMode, setSelectMode] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [showMovePicker, setShowMovePicker] = useState(false);
+  // 右键菜单/操作列触发的单个移动目标（区别于选择模式的批量移动）
+  const [moveSingle, setMoveSingle] = useState<FileRecord | null>(null);
   const [dragConsent, setDragConsent] = useState<FileRecord | null>(null);
   const [batchBusy, setBatchBusy] = useState(false);
   const [mfaDelete, setMfaDelete] = useState<{ ids: string[]; batch: boolean } | null>(null);
@@ -642,6 +644,25 @@ export default function FileExplorer({ onLock }: FileExplorerProps) {
       setSelected(new Set());
       setSelectMode(false);
     }
+    // 目标目录列表缓存失效：否则进入目标目录时看到的是移动前的旧快照（60s TTL 后才出现）
+    invalidateFolderSnapshot(targetId);
+    loadFiles(currentFolder, true);
+  };
+
+  const handleSingleMovePick = async (targetId: string | null) => {
+    const file = moveSingle;
+    setShowMovePicker(false);
+    setMoveSingle(null);
+    if (!file || batchBusy) return;
+    setBatchBusy(true);
+    try {
+      await api.moveFile(file.id, targetId);
+      setError('');
+    } catch (err: any) {
+      setError(err?.message || '移动失败');
+    }
+    setBatchBusy(false);
+    invalidateFolderSnapshot(targetId);
     loadFiles(currentFolder, true);
   };
 
@@ -1230,6 +1251,13 @@ export default function FileExplorer({ onLock }: FileExplorerProps) {
                           </>
                         )}
                         <button
+                          onClick={(e) => { e.stopPropagation(); setMoveSingle(file); setShowMovePicker(true); }}
+                          className="p-1.5 hover:bg-gray-700 rounded transition-colors"
+                          title="移动"
+                        >
+                          <Move className="w-4 h-4 text-gray-400" />
+                        </button>
+                        <button
                           onClick={(e) => { e.stopPropagation(); handleDelete(file); }}
                           className="p-1.5 hover:bg-red-500/20 rounded transition-colors"
                           title="删除"
@@ -1276,6 +1304,18 @@ export default function FileExplorer({ onLock }: FileExplorerProps) {
                 >
                   <Folder className="w-4 h-4" /> 打开
                 </button>
+                {!selectMode && (
+                  <button
+                    className="w-full px-3 py-2 text-left text-sm hover:bg-gray-700 flex items-center gap-2"
+                    onClick={() => {
+                      setMoveSingle(contextMenu.file);
+                      setContextMenu(null);
+                      setShowMovePicker(true);
+                    }}
+                  >
+                    <Move className="w-4 h-4" /> 移动
+                  </button>
+                )}
                 <button
                   className="w-full px-3 py-2 text-left text-sm hover:bg-gray-700 flex items-center gap-2"
                   onClick={() => {
@@ -1324,6 +1364,18 @@ export default function FileExplorer({ onLock }: FileExplorerProps) {
                 >
                   <Edit3 className="w-4 h-4" /> 重命名
                 </button>
+                {!selectMode && (
+                  <button
+                    className="w-full px-3 py-2 text-left text-sm hover:bg-gray-700 flex items-center gap-2"
+                    onClick={() => {
+                      setMoveSingle(contextMenu.file);
+                      setContextMenu(null);
+                      setShowMovePicker(true);
+                    }}
+                  >
+                    <Move className="w-4 h-4" /> 移动
+                  </button>
+                )}
                 {getPreviewMode(decryptedNames.get(contextMenu.file.id) || '') === 'text' && (
                   <button
                     className="w-full px-3 py-2 text-left text-sm hover:bg-gray-700 flex items-center gap-2"
@@ -1558,8 +1610,11 @@ export default function FileExplorer({ onLock }: FileExplorerProps) {
 
       {showMovePicker && (
         <FolderPicker
-          onPick={handleBatchMovePick}
-          onClose={() => setShowMovePicker(false)}
+          onPick={moveSingle ? handleSingleMovePick : handleBatchMovePick}
+          onClose={() => {
+            setShowMovePicker(false);
+            setMoveSingle(null);
+          }}
         />
       )}
     </div>

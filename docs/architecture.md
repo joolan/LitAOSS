@@ -113,9 +113,10 @@ AES-KW 包装 File Key (用 Account Key)
 - 文本编辑/内容更新**永远生成新 `oss_key` 并上传新对象**，从不原地覆盖旧对象；
   其他仍引用旧对象的记录不受影响，内容各自独立
 - 版本历史行对旧对象只是**只读引用**；恢复版本仅重指 `oss_key` 并清空 `content_hash`
-- `deleted_objects` 台账记录的是"该文件记录被删时对象仍存在"，**不是**
-  "对象可物理删除"的凭据——共享对象可能仍被其他有效记录引用；
-  若未来实现物理清理，必须先按 `content_hash`/`oss_key` 检查是否仍被引用
+- `deleted_objects` 台账登记时机 = **物理清理（回收站 purge）**，且登记前逐对象
+  检查 `oss_key` 是否仍被 `files`（任意状态）/`file_versions` 引用——仍被引用
+  （如去重复用的兄弟文件）的对象不登记；软删/恢复期间一律不登记。因此台账行
+  才是"该对象已无任何存活引用"的凭据，按台账手动清理不会误伤在用文件
 
 #### 下载/预览流程
 
@@ -194,7 +195,7 @@ File Key + AES-GCM 解密
 | 保证 | 实现方式 |
 |------|----------|
 | 零知识 | Master Key 仅在浏览器内存，服务端无任何明文密钥 |
-| 抗暴力破解 | PBKDF2 500k 迭代 + 最少 12 字符密码 + 5 次失败全局锁定（登录成功清零计数） |
+| 抗暴力破解 | PBKDF2 500k 迭代 + 最少 12 字符密码 + 5 次失败全局锁定（成功后的旧失败不计数，登录历史完整保留） |
 | 抗篡改 | AES-GCM 认证加密，任何篡改都会被检测 |
 | 密钥隔离 | 每文件独立密钥，单文件泄露不影响其他文件 |
 | SecretKey 保护 | 加密存储于配置文件，使用时解密 |
@@ -253,7 +254,7 @@ CREATE TABLE login_attempts (
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
--- 软删除台账 (OSS 对象不物理删除，仅登记)
+-- 删除台账 (物理清理时按剩余引用登记；OSS 对象不物理删除)
 CREATE TABLE deleted_objects (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     file_id TEXT NOT NULL,             -- 来源文件 UUID
@@ -328,7 +329,7 @@ db-backups/{lit-aoss_<ts>}.db.enc
 | GET | /api/files/:id | 获取单个文件信息 |
 | POST | /api/files | 创建文件记录 |
 | PUT | /api/files/:id/rename | 重命名文件 |
-| DELETE | /api/files/:id | 软删除文件 (写 deleted_objects 台账，不删 OSS 对象) |
+| DELETE | /api/files/:id | 软删除文件 (标记 deleted_at，不删 OSS 对象；台账在 purge 时按引用登记) |
 | POST | /api/files/batch-delete | 批量删除 (同上) |
 | GET | /api/deleted-objects | 查询软删除台账 |
 | GET | /api/audit | 操作审计分页查询 (按 action 过滤，文件名密文) |

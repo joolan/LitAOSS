@@ -27,11 +27,13 @@ type Config struct {
 
 // AlertConfig 登录失败告警：webhook_url 为空则功能关闭。
 // 同一 IP 在锁定窗口内失败次数达到 fail_threshold 时向 webhook POST JSON，
-// 冷却期内同一 IP 不重复发送。
+// 冷却期内同一 IP 不重复发送。Keyword 为通知标题前缀关键字（钉钉等平台的
+// 自定义关键词校验要求正文包含指定词才放行），置空则不加前缀。
 type AlertConfig struct {
 	WebhookURL      string `json:"webhook_url"`
-	FailThreshold   int    `json:"fail_threshold"`   // <=0 取 5
-	CooldownSeconds int    `json:"cooldown_seconds"` // <=0 取 600
+	Keyword         string `json:"keyword"`           // 标题前缀关键字，如「告警」；空 = 不加
+	FailThreshold   int    `json:"fail_threshold"`    // <=0 取 5
+	CooldownSeconds int    `json:"cooldown_seconds"`  // <=0 取 600
 }
 
 // TrashConfig 回收站保留策略。RetentionDays：软删数据自动物理清理的保留天数，
@@ -110,6 +112,7 @@ func DefaultConfig() *Config {
 			MaxBackups:     10,
 		},
 		Alert: AlertConfig{
+			Keyword:         "告警",
 			FailThreshold:   5,
 			CooldownSeconds: 600,
 		},

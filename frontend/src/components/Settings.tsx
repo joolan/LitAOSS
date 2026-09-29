@@ -81,7 +81,8 @@ export default function Settings({ onClose }: SettingsProps) {
         className="bg-gray-900 rounded-2xl w-full max-w-2xl max-h-[90vh] flex flex-col overflow-hidden"
         onClick={(e) => e.stopPropagation()}
       >
-        <div className="flex items-center justify-between px-6 py-4 border-b border-gray-800">
+        {/* shrink-0：内容区数据多时不得压缩标题与 tab 栏（移动端曾出现 tab 被截断） */}
+        <div className="flex items-center justify-between px-6 py-4 border-b border-gray-800 shrink-0">
           <div className="flex items-center gap-3">
             <SettingsIcon className="w-5 h-5 text-emerald-400" />
             <h2 className="text-lg font-semibold text-white">设置</h2>
@@ -94,7 +95,7 @@ export default function Settings({ onClose }: SettingsProps) {
           <button onClick={onClose} className="text-gray-400 hover:text-white text-lg">&times;</button>
         </div>
 
-        <div className="flex border-b border-gray-800 overflow-x-auto">
+        <div className="flex border-b border-gray-800 overflow-x-auto shrink-0">
           <button
             onClick={() => setTab('encrypt-tool')}
             className={`flex-auto px-3 py-3 text-sm font-medium whitespace-nowrap transition-colors ${
@@ -178,7 +179,7 @@ export default function Settings({ onClose }: SettingsProps) {
           </button>
         </div>
 
-        <div className="flex-1 overflow-auto p-6">
+        <div className="flex-1 min-h-0 overflow-auto p-6">
           {tab === 'encrypt-tool' && <FileEncryptTool />}
 
           {tab === 'encrypt' && (

@@ -42,7 +42,13 @@ func (h *Handler) maybeAlertLoginFailure(ip string) {
 	h.alertLast[ip] = time.Now()
 	h.alertMu.Unlock()
 
+	// 关键字置于标题最前面：钉钉等平台的「自定义关键词」校验要求内容包含指定词
+	title := "LitAOSS 登录失败告警"
+	if ac.Keyword != "" {
+		title = ac.Keyword + " " + title
+	}
 	payload := map[string]any{
+		"title":     title,
 		"event":     "login_failed",
 		"app":       "LitAOSS",
 		"ip":        ip,

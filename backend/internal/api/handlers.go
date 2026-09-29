@@ -183,10 +183,6 @@ func (h *Handler) Login(c *gin.Context) {
 		return
 	}
 
-	h.db.RecordLoginAttempt(ip, true)
-	// 全局锁定约定：登录成功即清零失败累计，历史失败不影响后续登录
-	h.db.ClearFailedLoginAttempts()
-
 	encKey, err := h.db.GetEncryptedAccountKey()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.LoginResponse{OK: false, Error: err.Error()})
@@ -205,6 +201,12 @@ func (h *Handler) Login(c *gin.Context) {
 		if mfaRecord != nil && mfaRecord.Enabled {
 			mfaRequired = true
 		}
+	}
+
+	// 成功记录 = 完整登录：MFA 关闭时密码正确即记；开启时由 VerifyTOTP/恢复码
+	// 通过后再记。历史失败行一律保留（审计），锁定计数按「晚于最近成功的失败」计算。
+	if !mfaRequired {
+		h.db.RecordLoginAttempt(ip, true)
 	}
 
 	var token string
@@ -560,30 +562,6 @@ func (h *Handler) PresignDownload(c *gin.Context) {
 	c.JSON(http.StatusOK, models.PresignResponse{URL: url})
 }
 
-// recordFileDeletion 软删除台账: 不再调用 OSS DeleteObject，对象保留在 OSS 上，
-// 主对象与该文件的全部历史版本对象一并登记到 deleted_objects（文件名存密文，保持零知识）
-func (h *Handler) recordFileDeletion(file *models.FileRecord, reason string) {
-	if file.IsDirectory || file.OSSKey == "" {
-		return
-	}
-	if err := h.db.RecordDeletedObject(file.ID, file.NameEncrypted, file.OSSKey, file.FileType, reason, file.FileSize, false); err != nil {
-		log.Printf("record deleted object failed (%s): %v", file.OSSKey, err)
-	}
-	versions, err := h.db.GetFileVersions(file.ID)
-	if err != nil {
-		log.Printf("list versions for deletion ledger failed (file %s): %v", file.ID, err)
-		return
-	}
-	for _, v := range versions {
-		if v.OSSKey == "" || v.OSSKey == file.OSSKey {
-			continue
-		}
-		if err := h.db.RecordDeletedObject(file.ID, file.NameEncrypted, v.OSSKey, file.FileType, reason, v.FileSize, true); err != nil {
-			log.Printf("record deleted version object failed (%s): %v", v.OSSKey, err)
-		}
-	}
-}
-
 func (h *Handler) DeleteFile(c *gin.Context) {
 	if !h.requireDeleteMFA(c) {
 		return
@@ -601,8 +579,7 @@ func (h *Handler) DeleteFile(c *gin.Context) {
 		return
 	}
 
-	h.recordFileDeletion(file, "单个删除")
-
+	// 软删仅标记：删除台账在物理清理（purge）时按剩余引用登记，见 db.purgeTrash
 	if err := h.db.SoftDeleteFile(req.ID); err != nil {
 		c.JSON(http.StatusInternalServerError, models.MessageResponse{OK: false, Error: err.Error()})
 		return
@@ -801,9 +778,7 @@ func (h *Handler) BatchDelete(c *gin.Context) {
 	}
 
 	for _, id := range req.IDs {
-		file, err := h.db.GetFile(id)
-		if err == nil {
-			h.recordFileDeletion(file, "批量删除")
+		if file, err := h.db.GetFile(id); err == nil {
 			h.audit(c, "delete", "file", id, file.NameEncrypted, "批量删除")
 		}
 		h.db.SoftDeleteFile(id)
@@ -1339,11 +1314,13 @@ func (h *Handler) VerifyTOTPEndpoint(c *gin.Context) {
 
 	if !VerifyTOTP(mfaRecord.Secret, req.Code) {
 		h.db.RecordTOTPAttempt(false)
+		h.db.RecordLoginAttempt(c.ClientIP(), false)
 		c.JSON(http.StatusBadRequest, models.MessageResponse{OK: false, Error: "invalid TOTP code"})
 		return
 	}
 
 	h.db.RecordTOTPAttempt(true)
+	h.db.RecordLoginAttempt(c.ClientIP(), true)
 	h.sessions.CompleteMFA(token)
 
 	c.JSON(http.StatusOK, models.MessageResponse{OK: true})
@@ -1486,11 +1463,13 @@ func (h *Handler) VerifyRecoveryCode(c *gin.Context) {
 	}
 	if !ok {
 		h.db.RecordTOTPAttempt(false)
+		h.db.RecordLoginAttempt(c.ClientIP(), false)
 		c.JSON(http.StatusBadRequest, models.MessageResponse{OK: false, Error: "invalid or already used recovery code"})
 		return
 	}
 
 	h.db.RecordTOTPAttempt(true)
+	h.db.RecordLoginAttempt(c.ClientIP(), true)
 	h.sessions.CompleteMFA(token)
 
 	c.JSON(http.StatusOK, models.MessageResponse{OK: true})

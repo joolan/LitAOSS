@@ -196,7 +196,7 @@ pending 会话流转与失败锁定；恢复码**一次性消费**，用过即�
 
 ### GET /api/auth/login-history
 
-获取最近 50 条登录尝试（倒序，含成功与失败）。成功登录后失败记录会被清零，因此历史通常是「全部成功 + 距上次成功以来的失败」。IP 取自可信代理提交的 `X-Forwarded-For`（见 `server.trusted_proxies`）。
+获取最近 50 条登录尝试（倒序，含成功与失败）。密码错误与 MFA 验证失败均记录且**完整保留**（成功登录后旧失败不再删除，只按"晚于最近一次成功的失败"计算锁定计数）。IP 取自可信代理提交的 `X-Forwarded-For`（见 `server.trusted_proxies`）。
 
 **响应:**
 ```json
@@ -497,7 +497,7 @@ pending 会话流转与失败锁定；恢复码**一次性消费**，用过即�
 
 ### DELETE /api/files/:id
 
-软删除文件 (设置 deleted_at)。**OSS 对象不物理删除**: 主对象与该文件全部历史版本对象写入 `deleted_objects` 台账 (reason=`单个删除`)，对象保留在 OSS 上。
+软删除文件 (设置 deleted_at)。**OSS 对象不物理删除**；此阶段不登记台账（对象需支撑恢复与历史版本），`deleted_objects` 台账在物理清理时按剩余引用登记（见 `POST /api/trash/purge`）。
 
 **请求:**
 ```json
@@ -515,7 +515,7 @@ pending 会话流转与失败锁定；恢复码**一次性消费**，用过即�
 
 ### POST /api/files/batch-delete
 
-批量删除文件。同样写入 `deleted_objects` 台账 (reason=`批量删除`)，不触碰 OSS。
+批量删除文件。同样仅标记软删，不触碰 OSS、不登记台账（时机同单个删除）。
 
 **请求:**
 ```json
@@ -533,7 +533,7 @@ pending 会话流转与失败锁定；恢复码**一次性消费**，用过即�
 
 ### GET /api/deleted-objects
 
-查询软删除台账: 所有保留在 OSS 上但已逻辑删除的对象 (主对象 + 历史版本对象)，按删除时间倒序。文件名以 Account Key 密文存储 (零知识，服务端不可读)。
+查询删除台账: 已**物理清理**（purge）且经引用检查确认无任何存活引用的对象 (主对象 + 历史版本对象，去重复用的共享对象仅在最后一个引用消失后登记)，按登记时间倒序。文件名以 Account Key 密文存储 (零知识，服务端不可读)。
 
 **权限:** 需有效会话
 
@@ -550,14 +550,14 @@ pending 会话流转与失败锁定；恢复码**一次性消费**，用过即�
       "file_size": 102400,
       "file_type": "text/plain",
       "is_version": false,
-      "reason": "单个删除",
+      "reason": "回收站物理清理",
       "deleted_at": "2026-09-25T12:00:00Z"
     }
   ]
 }
 ```
 
-`is_version: true` 表示该文件的历史版本对象；`reason` 取值: `单个删除` / `批量删除` (后端固定，不可自定义)。
+`is_version: true` 表示该文件的历史版本对象；`reason` 取值: `回收站物理清理`（物理清理登记时固定写入）。
 
 ### GET /api/audit
 
@@ -642,7 +642,7 @@ pending 会话流转与失败锁定；恢复码**一次性消费**，用过即�
 { "ok": true, "purged": 12 }
 ```
 
-超过 `trash.retention_days` 的条目由后台任务每日自动物理清理 (启动时补跑)；台账 `deleted_objects` 保留 90 天、审计 `audit_log` 保留 180 天后清理。
+超过 `trash.retention_days` 的条目由后台任务每日自动物理清理 (启动时补跑)，清理时按剩余引用登记台账 `deleted_objects`；台账保留 90 天、审计 `audit_log` 保留 180 天后清理。
 
 ---
 

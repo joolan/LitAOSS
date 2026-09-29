@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { AlertCircle, FileText, Folder, RotateCcw, Shield, Trash2, X } from 'lucide-react';
 import { api, TrashItem } from '../api/client';
 import { decryptNameForStorage } from '../crypto/fileKey';
+import { invalidateFolderSnapshot } from '../fileListCache';
 
 function formatSize(bytes: number): string {
   if (!bytes) return '0 B';
@@ -74,7 +75,10 @@ export default function TrashDialog({ onClose, onChanged }: TrashDialogProps) {
     setInfo('');
     setError('');
     try {
-      await api.restoreFile(it.id);
+      const res = await api.restoreFile(it.id);
+      // 恢复目标目录（后端返回实际位置，原目录已删则为根）缓存失效，
+      // 否则进入该目录时看到恢复前的旧列表
+      invalidateFolderSnapshot(res.parent_id);
       setInfo(`已恢复「${names.get(it.id) || it.id}」`);
       await refresh();
       onChanged();

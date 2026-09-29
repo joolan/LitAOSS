@@ -28,7 +28,7 @@ export default function LoginHistory() {
     <div>
       <div className="flex items-center justify-between mb-3">
         <p className="text-xs text-gray-500">
-          最近 50 条登录尝试；登录成功后失败记录自动清零（全局锁定）
+          最近 50 条登录尝试（含密码与 MFA 验证失败，完整保留）；成功登录后的旧失败不计入锁定计数
         </p>
         <button
           onClick={load}

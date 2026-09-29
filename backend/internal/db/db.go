@@ -332,17 +332,18 @@ func (d *Database) RecordLoginAttempt(ip string, success bool) error {
 	return err
 }
 
-// ClearFailedLoginAttempts 登录成功后清零失败累计（全局锁定的设计约定：
-// 锁定是全局的，因此成功登录必须重置计数，避免历史失败拖累后续登录）。
-func (d *Database) ClearFailedLoginAttempts() error {
-	_, err := d.conn.Exec("DELETE FROM login_attempts WHERE success = 0")
-	return err
-}
-
+// GetFailedLoginCount 窗口内、且 id 晚于最近一次成功登录的失败次数。
+// 「成功后的旧失败不计数」等价于历史上的物理清零约定，但不再删除历史行——
+// 登录日志完整保留密码错误/MFA 错误记录供审计，锁定语义保持不变。
+// 用自增 id 比较顺序（而非 created_at），同秒插入的记录也不失准。
 func (d *Database) GetFailedLoginCount(since time.Duration) (int, error) {
 	var count int
 	err := d.conn.QueryRow(
-		"SELECT COUNT(*) FROM login_attempts WHERE success = 0 AND created_at > datetime('now', ?)",
+		`SELECT COUNT(*) FROM login_attempts
+		 WHERE success = 0
+		   AND created_at > datetime('now', ?)
+		   AND id > COALESCE(
+		         (SELECT MAX(id) FROM login_attempts WHERE success = 1), 0)`,
 		sqliteSinceModifier(since),
 	).Scan(&count)
 	if err != nil {
@@ -351,12 +352,18 @@ func (d *Database) GetFailedLoginCount(since time.Duration) (int, error) {
 	return count, nil
 }
 
-// GetFailedLoginCountByIP 指定 IP 在窗口内的失败次数（登录失败告警阈值判定）
+// GetFailedLoginCountByIP 指定 IP 窗口内、且 id 晚于该 IP 最近一次成功登录的失败次数
+// （登录失败告警阈值判定；口径与 GetFailedLoginCount 一致）
 func (d *Database) GetFailedLoginCountByIP(ip string, since time.Duration) (int, error) {
 	var count int
 	err := d.conn.QueryRow(
-		"SELECT COUNT(*) FROM login_attempts WHERE success = 0 AND ip_address = ? AND created_at > datetime('now', ?)",
-		ip, sqliteSinceModifier(since),
+		`SELECT COUNT(*) FROM login_attempts
+		 WHERE success = 0
+		   AND ip_address = ?
+		   AND created_at > datetime('now', ?)
+		   AND id > COALESCE(
+		         (SELECT MAX(id) FROM login_attempts WHERE success = 1 AND ip_address = ?), 0)`,
+		ip, sqliteSinceModifier(since), ip,
 	).Scan(&count)
 	if err != nil {
 		return 0, err
@@ -364,8 +371,9 @@ func (d *Database) GetFailedLoginCountByIP(ip string, since time.Duration) (int,
 	return count, nil
 }
 
-// GetLoginHistory 按时间倒序返回最近 limit 条登录尝试（成功登录后失败记录
-// 会被清零，因此表中通常是「全部成功记录 + 距上次成功以来的失败」）。
+// GetLoginHistory 按时间倒序返回最近 limit 条登录尝试。
+// 含密码错误与 MFA 验证失败记录（成功登录不再物理删除历史失败行，
+// 锁定计数改由「晚于最近一次成功的失败」计算，见 GetFailedLoginCount）。
 func (d *Database) GetLoginHistory(limit int) ([]models.LoginAttempt, error) {
 	rows, err := d.conn.Query(
 		"SELECT id, ip_address, success, created_at FROM login_attempts ORDER BY id DESC LIMIT ?",
@@ -409,6 +417,10 @@ func (d *Database) RecordAudit(action, targetType, targetID, targetName, detail,
 func (d *Database) ListAudit(page, pageSize int, action string) ([]models.AuditEntry, int, error) {
 	if page < 1 {
 		page = 1
+	}
+	// 上限防 (page-1)*pageSize 溢出与无意义深翻页
+	if page > 1_000_000 {
+		page = 1_000_000
 	}
 	if pageSize < 1 || pageSize > 200 {
 		pageSize = 50
@@ -655,6 +667,18 @@ func (d *Database) ListTrash() ([]TrashItem, error) {
 	return out, rows.Err()
 }
 
+// ObjectRefCount oss_key 被 files（任意状态）或 file_versions 引用的总行数。
+// 软删行也算引用——行未物理删除前对象随时可能随恢复重新在用，不可登记清理。
+func (d *Database) ObjectRefCount(ossKey string) (int, error) {
+	var n int
+	err := d.conn.QueryRow(
+		`SELECT (SELECT COUNT(*) FROM files WHERE oss_key = ?)
+		      + (SELECT COUNT(*) FROM file_versions WHERE oss_key = ?)`,
+		ossKey, ossKey,
+	).Scan(&n)
+	return n, err
+}
+
 // RestoreFile 恢复软删行：原父目录仍存在且未删除则回原位，否则回根目录。
 // 返回实际恢复到的 parent_id（nil = 根目录）。行不存在或未删除返回 sql.ErrNoRows。
 func (d *Database) RestoreFile(id string) (*string, error) {
@@ -686,22 +710,124 @@ func (d *Database) RestoreFile(id string) (*string, error) {
 	if n, _ := res.RowsAffected(); n == 0 {
 		return nil, sql.ErrNoRows
 	}
+	// 撤下历史遗留（登记时机迁移前的旧数据）的台账条目：对象重新在用，
+	// 不可再被按台账清理。尽力而为，失败不影响恢复本身。
+	_, _ = d.conn.Exec("DELETE FROM deleted_objects WHERE file_id = ?", id)
 	return target, nil
 }
 
 // purgeTrash 物理删除全部软删行及其后代（子项未标记 deleted_at 但随父消失）。
 // files 行形成树且禁止建环（MoveFile 防环），递归 CTE 不会无限展开。
+// 同步删除这些行的历史版本记录（file_versions），避免留下孤儿行。
+// 不触碰 OSS 对象：同内容寻址复用同一 oss_key 的其他存活文件不受影响。
+// 台账登记时机 = 物理清理（而非软删）：软删/回收站期间对象仍需支撑恢复与
+// 历史版本回溯，一律不登记；purge 后逐对象检查剩余引用（files 任意状态 +
+// file_versions），仍被引用（如去重复用的兄弟文件）的对象不登记，绝无误删引导。
 func (d *Database) purgeTrash(extraCond string, args ...any) (int64, error) {
-	q := `WITH RECURSIVE trash_tree(id) AS (
+	cte := `WITH RECURSIVE trash_tree(id) AS (
 		SELECT id FROM files WHERE deleted_at IS NOT NULL` + extraCond + `
 		UNION ALL
 		SELECT f.id FROM files f JOIN trash_tree t ON f.parent_id = t.id
-	) DELETE FROM files WHERE id IN (SELECT id FROM trash_tree)`
-	res, err := d.conn.Exec(q, args...)
+	)`
+
+	// 1. 收集本批待删对象（主对象 + 历史版本对象），供删除后登记台账
+	type fileMeta struct {
+		name, ftype string
+	}
+	var metas = map[string]fileMeta{}
+	type ledgerObj struct {
+		fileID, name, ossKey, ftype string
+		size                        int64
+		isVersion                   bool
+	}
+	var ledger []ledgerObj
+
+	rows, err := d.conn.Query(
+		cte+` SELECT id, name_encrypted, oss_key, file_type, file_size FROM files WHERE id IN (SELECT id FROM trash_tree)`,
+		args...,
+	)
 	if err != nil {
 		return 0, err
 	}
-	return res.RowsAffected()
+	for rows.Next() {
+		var id, name, ossKey, ftype string
+		var size int64
+		if err := rows.Scan(&id, &name, &ossKey, &ftype, &size); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		metas[id] = fileMeta{name, ftype}
+		if ossKey != "" {
+			ledger = append(ledger, ledgerObj{id, name, ossKey, ftype, size, false})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, err
+	}
+	rows.Close()
+
+	vrows, err := d.conn.Query(
+		cte+` SELECT file_id, oss_key, file_size FROM file_versions WHERE file_id IN (SELECT id FROM trash_tree)`,
+		args...,
+	)
+	if err != nil {
+		return 0, err
+	}
+	for vrows.Next() {
+		var fileID, ossKey string
+		var size int64
+		if err := vrows.Scan(&fileID, &ossKey, &size); err != nil {
+			vrows.Close()
+			return 0, err
+		}
+		if ossKey == "" {
+			continue
+		}
+		m := metas[fileID]
+		ledger = append(ledger, ledgerObj{fileID, m.name, ossKey, m.ftype, size, true})
+	}
+	if err := vrows.Err(); err != nil {
+		vrows.Close()
+		return 0, err
+	}
+	vrows.Close()
+
+	// 2. 物理删除版本行与主行（原有逻辑）
+	if _, err := d.conn.Exec(
+		cte+` DELETE FROM file_versions WHERE file_id IN (SELECT id FROM trash_tree)`,
+		args...,
+	); err != nil {
+		return 0, err
+	}
+	res, err := d.conn.Exec(
+		cte+` DELETE FROM files WHERE id IN (SELECT id FROM trash_tree)`,
+		args...,
+	)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+
+	// 3. 行已删：无剩余引用的对象登记台账（同 oss_key 去重，登记一次即可）
+	seen := map[string]bool{}
+	for _, o := range ledger {
+		if seen[o.ossKey] {
+			continue
+		}
+		seen[o.ossKey] = true
+		ref, err := d.ObjectRefCount(o.ossKey)
+		if err != nil || ref > 0 {
+			continue // 仍被存活文件/版本引用（去重复用），不可按台账清理
+		}
+		if err := d.RecordDeletedObject(o.fileID, o.name, o.ossKey, o.ftype, "回收站物理清理", o.size, o.isVersion); err != nil {
+			continue // 登记失败不阻塞清理（对象本来就不物理删除）
+		}
+	}
+	return n, nil
 }
 
 // PurgeExpiredTrash 清理超过保留期的软删行（含后代）；days<=0 = 永不自动清理

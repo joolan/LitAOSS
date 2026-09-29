@@ -34,6 +34,7 @@
   },
   "alert": {
     "webhook_url": "",
+    "keyword": "告警",
     "fail_threshold": 5,
     "cooldown_seconds": 600
   },

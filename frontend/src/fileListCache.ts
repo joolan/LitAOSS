@@ -44,3 +44,9 @@ export function putCachedSnapshot(
 export function invalidateListCache(): void {
   snapshots.clear();
 }
+
+// 单目录失效：跨目录数据变更（移动到 X、恢复到 X）后，
+// 目标目录的缓存快照必须立即过期，否则下次导航会看到旧列表（60s TTL 才兜底）
+export function invalidateFolderSnapshot(parentId: string | null): void {
+  snapshots.delete(key(parentId));
+}

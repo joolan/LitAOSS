@@ -266,7 +266,7 @@ nssm start LitAOSS
 }
 ```
 
-> **不要授予 `oss:DeleteObject`** — 系统所有删除均为软删除: 对象保留在 OSS 上，由 `deleted_objects` 台账登记（文件名密文、原因、时间），代码中不存在任何 `DeleteObject` 调用（编译期保证）。ACL 类操作 (`GetObjectAcl`/`PutObjectAcl`) 也未被使用。
+> **不要授予 `oss:DeleteObject`** — 系统所有删除均为软删除: 对象保留在 OSS 上，`deleted_objects` 台账在物理清理（purge）时按剩余引用登记（文件名密文、原因、时间），代码中不存在任何 `DeleteObject` 调用（编译期保证）。ACL 类操作 (`GetObjectAcl`/`PutObjectAcl`) 也未被使用。
 >
 > **对象清理**: 撤销 DeleteObject 后系统内无法物理删除对象，存储只增不减；需在 OSS 控制台按台账 (`GET /api/deleted-objects` 或查库) 手动删除，或临时恢复权限。**不可用 OSS 生命周期规则代替**——它无法区分存活对象与软删对象，会误删在用文件。
 >
@@ -311,6 +311,7 @@ cp backend/config.example.json backend/config.json   # Windows: copy
 | `oss.encrypted_sk` | 加密后的 SecretKey，留空则使用明文 `secret_key` |
 | `backup.*` | 自动备份、文件变更触发、OSS 加密上传各开关 |
 | `alert.webhook_url` | 登录失败告警 webhook，留空关闭；同 IP 锁定窗口内失败达阈值后 POST JSON（5s 超时） |
+| `alert.keyword` | 告警通知 title 前缀关键字（钉钉自定义关键词校验用），默认 `告警`；空 = 不加前缀 |
 | `alert.fail_threshold` | 触发告警的失败次数阈值，默认 5（<=0 视为 5） |
 | `alert.cooldown_seconds` | 同一 IP 告警冷却秒数，默认 600（<=0 视为 600） |
 | `trash.retention_days` | 回收站保留天数，默认 30；0 = 从不自动清理 |
